@@ -1114,6 +1114,9 @@ pub struct FlipTimerContext {
     //pub addrs: [(AtomicU64, AtomicPtr<Allocation>); 16],
     pub flipq: [Option<Arc<ArrayQueue<(Weak<Allocation>, u64)>>>; 16],
     pub vsync_enabled: AtomicBool,
+    pub callback_active: AtomicBool,
+    pub callback_count: AtomicU64,
+    pub timer_armed: AtomicBool,
     pub last_vblank_timestamp: AtomicU64,
     pub refresh_num: AtomicU32,
     pub refresh_den: AtomicU32,
@@ -1124,6 +1127,14 @@ unsafe impl Send for FlipTimerContext {}
 
 impl FlipTimerContext {
     fn flip(&self) {
+        self.callback_active.store(true, Ordering::Release);
+
+        if self.chan.is_resetting() {
+            self.callback_active.store(false, Ordering::Release);
+            self.callback_count.fetch_add(1, Ordering::Release);
+            return;
+        }
+
         let (timestamp, _) = ke_query_performance_counter();
         self.last_vblank_timestamp.store(timestamp, Ordering::Release);
 
@@ -1233,6 +1244,9 @@ impl FlipTimerContext {
         if scanout_sent {
             self.chan.kick();
         }
+
+        self.callback_active.store(false, Ordering::Release);
+        self.callback_count.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1291,7 +1305,9 @@ impl FlipTimer {
         let (timestamp, _) = ke_query_performance_counter();
         self.inner.last_vblank_timestamp.store(timestamp, Ordering::Release);
 
-        Ok(self.timer.start_periodic(period)?)
+        self.timer.start_periodic(period)?;
+        self.inner.timer_armed.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub fn set_rect(&self, scanout: usize, rect: commands::Rect) {
@@ -1317,7 +1333,42 @@ impl FlipTimer {
         mode.raster_status(elapsed, frequency, refresh_rate)
     }
 
+    pub fn reset_after_tdr(&self) {
+        let was_armed = self.inner.timer_armed.swap(false, Ordering::AcqRel);
+        let callback_count = self.inner.callback_count.load(Ordering::Acquire);
+        let cancelled = self.timer.cancel();
+
+        /*
+         * ExCancelTimer returning false for an armed timer means that its
+         * expiration has already won the race and the callback is in progress
+         * or queued to run. Wait for that callback to finish before allowing
+         * the VirtIO device reset to proceed. A callback that starts here sees
+         * QueueHandler::resetting and exits without touching the transport.
+         */
+        if was_armed && !cancelled {
+            while self.inner.callback_active.load(Ordering::Acquire)
+                || self.inner.callback_count.load(Ordering::Acquire) == callback_count
+            {
+                core::hint::spin_loop();
+            }
+        } else {
+            while self.inner.callback_active.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+        }
+
+        self.inner.last_vblank_timestamp.store(0, Ordering::Release);
+
+        for addr in &self.inner.addrs {
+            addr.store(0, Ordering::Release);
+        }
+        for queue in self.inner.flipq.iter().flatten() {
+            while queue.pop().is_some() {}
+        }
+    }
+
     pub fn stop(&self) -> Result<(), NtStatus> {
+        self.inner.timer_armed.store(false, Ordering::Release);
         self.timer.cancel();
         Ok(())
     }
@@ -1621,6 +1672,11 @@ impl VidPnOutput {
                 )
             )
             .collect()
+    }
+
+    pub fn reset_after_tdr(&self) {
+        self.cursor.lock().take();
+        while self.flipq.pop().is_some() {}
     }
 
     pub fn new(info: commands::DisplayOne, edid: Box<Edid>) -> Self {

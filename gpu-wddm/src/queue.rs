@@ -70,6 +70,7 @@ use virtio_drivers::{
             bus::*,
         },
         DeviceType,
+        DeviceStatus,
         Transport,
         InterruptStatus,
     },
@@ -275,6 +276,25 @@ impl<const MAX_INLINE: usize> Default for Callback<MAX_INLINE> {
         Self::None
     }
 }
+impl<const MAX_INLINE: usize> Callback<MAX_INLINE> {
+    fn abort(self, data: &GpuData) {
+        match self {
+            Self::None => {},
+            Self::SetEvent(block) => {
+                block.cancel();
+                block.set();
+            },
+            Self::FreeContextId(id) => data.context_id.free(id.get()),
+            Self::FreeResourceId(id) => data.resource_id.free(id.get()),
+            Self::DmaCompleted(_, _) => {},
+            Self::DmaCompletedWithAllocations(_, _, allocations) => drop(allocations),
+            Self::DmaCompletedBatched(_, _, allocations) => drop(allocations),
+            Self::DisplayInfo => {},
+            Self::DisplayEdid(_, _) => {},
+        }
+    }
+}
+
 
 //impl Callback {
 //    // pub fn blocking(event: ...) -> Self
@@ -571,6 +591,8 @@ struct AsyncQueue<T> {
     #[pin]
     event: KeEvent,
 
+    enabled: AtomicBool,
+    active_producers: AtomicU32,
     q: ArraySegQueue<T>,
 }
 
@@ -583,6 +605,8 @@ impl<T> AsyncQueue<T> {
     fn init(cap: usize) -> impl PinInit<Self, NtStatus> {
         pin_init!(Self {
             event <- KeEvent::new(EventType::Synchronization, false),
+            enabled: AtomicBool::new(true),
+            active_producers: AtomicU32::new(0),
             q: ArraySegQueue::new(cap),
         }? NtStatus)
     }
@@ -624,7 +648,15 @@ impl<const IN: usize, const OUT: usize> QueueChannel<IN, OUT> {
     }
 
     pub fn request_async_buf(&self, input: MaybeInlineBuffer<IN>, output: MaybeInlineBuffer<OUT>, callback: Callback<OUT>) -> Result<(), NtStatus> {
+        self.0.active_producers.fetch_add(1, Ordering::AcqRel);
+
+        if !self.0.enabled.load(Ordering::Acquire) {
+            self.0.active_producers.fetch_sub(1, Ordering::Release);
+            return Err(NtStatus(STATUS::DEVICE_NOT_READY));
+        }
+
         self.0.push(Buffer { input, output, callback });
+        self.0.active_producers.fetch_sub(1, Ordering::Release);
         Ok(())
     }
 
@@ -706,10 +738,23 @@ impl<const IN: usize, const OUT: usize> QueueChannel<IN, OUT> {
         let output = MaybeInlineBuffer::try_new_zeroed::<Rsp>()?;
         let callback = Callback::DmaCompletedBatched(engine, fence, allocations);
 
-        self.0.push(Buffer { input, output, callback });
-        Ok(())
+        self.request_async_buf(input, output, callback)
     }
 
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.0.enabled.store(enabled, Ordering::Release);
+
+        if !enabled {
+            while self.0.active_producers.load(Ordering::Acquire) != 0 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    pub fn drain(&self) -> impl Iterator<Item = Buffer<IN, OUT>> + '_ {
+        core::iter::from_fn(|| self.0.pop())
+    }
     pub fn pop_queued_request(&self) -> Option<Buffer<IN, OUT>> {
         self.0.pop()
     }
@@ -754,6 +799,42 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
             free <- init_free,
             //last_submitted_fence: AtomicU64::new(0),
         }? NtStatus)
+    }
+
+    fn abort_all(&mut self, data: &GpuData) {
+        for buffer in self.chan.drain() {
+            buffer.callback.abort(data);
+        }
+
+        for i in 0..SIZE {
+            take(&mut self.buffers.callbacks[i]).abort(data);
+            self.buffers.inputs[i].take();
+            self.buffers.outputs[i].take();
+            self.buffers.indices[i] = None;
+        }
+
+        while self.free.pop().is_some() {}
+        for i in 0..SIZE {
+            self.free.push(i).unwrap();
+        }
+    }
+
+    fn reinitialize(
+        &mut self,
+        pci_transport: &mut PciTransport,
+        access_platform: bool,
+        indirect: bool,
+        event_idx: bool,
+    ) -> Result<(), NtStatus> {
+        self.queue = map_virtio_error!(VirtQueue::<DxgkInterface, SIZE>::new(
+            pci_transport,
+            Q,
+            indirect,
+            event_idx,
+            access_platform,
+        ))?;
+        self.queue.set_dev_notify(true);
+        Ok(())
     }
 
     fn push_to_device(&mut self, pci_transport: &mut PciTransport, i: usize, buffer: Buffer<IN, OUT>) -> Result<(), NtStatus> {
@@ -1486,6 +1567,15 @@ impl EngineState {
         self.last_completed_timestamp.store(now, Ordering::SeqCst);
     }
 
+    fn reset_after_adapter_tdr(&self) {
+        let last_submitted = self.last_submitted_fence.load(Ordering::SeqCst);
+        self.last_completed_fence.store(last_submitted, Ordering::SeqCst);
+        self.last_preemption_fence.store(0, Ordering::SeqCst);
+        self.pending_fences.lock().clear();
+        self.last_submitted_timestamp.store(0, Ordering::SeqCst);
+        self.last_completed_timestamp.store(0, Ordering::SeqCst);
+    }
+
     fn is_responsive(&self) -> bool {
         let last_submitted_fence = self.last_submitted_fence.load(Ordering::SeqCst);
         let last_completed_fence = self.last_completed_fence.load(Ordering::SeqCst);
@@ -1547,6 +1637,11 @@ impl FenceTracker {
         let next_fence = self.next_fence.load(Ordering::SeqCst);
         fence < next_fence && !self.unsignaled.read().contains(&fence)
     }
+
+    fn reset_after_adapter_tdr(&self) {
+        self.next_fence.store(0, Ordering::SeqCst);
+        self.unsignaled.write().clear();
+    }
 }
 
 #[derive(Debug)]
@@ -1603,6 +1698,7 @@ struct GpuData {
     context_id: SimpleIdAllocator,
     offset_allocator: SpinMutex<offset_allocator::Allocator>,
     irq: AtomicU32,
+    resetting: AtomicBool,
     //fence: CachePadded<AtomicU64>,
     fence: FenceTracker,
 
@@ -1636,6 +1732,7 @@ impl GpuData {
             fence: FenceTracker::new(),
             //fence: CachePadded::new(AtomicU64::new(0)),
             irq: AtomicU32::new(0),
+            resetting: AtomicBool::new(false),
             engines <- init_array_from_fn(|_| EngineState {
                 last_submitted_fence: AtomicU32::new(0),
                 last_completed_fence: AtomicU32::new(0),
@@ -1646,6 +1743,36 @@ impl GpuData {
             }),
             fence_submissions: SpinMutex::new(SmallVec::new()),
         }? NtStatus)
+    }
+
+    fn reset_after_adapter_tdr(&self) {
+        self.fence.reset_after_adapter_tdr();
+        self.fence_submissions.lock().clear();
+        self.irq.store(0, Ordering::SeqCst);
+
+        for engine in &self.engines {
+            engine.reset_after_adapter_tdr();
+        }
+    }
+
+    fn restart_after_adapter_tdr(&self) {
+        /*
+         * Windows may still destroy old contexts and allocations between
+         * ResetFromTimeout and RestartFromTimeout. Keep their resource IDs
+         * and shared-memory ranges reserved until those objects are actually
+         * released; reusing either here could alias a still-live KMD object.
+         *
+         * Commands attempted during the cleanup window never reached the
+         * device because the queue channels were disabled, so fold those
+         * software-only submissions into the completed fence state now.
+         */
+        self.fence.reset_after_adapter_tdr();
+        self.fence_submissions.lock().clear();
+        self.irq.store(0, Ordering::SeqCst);
+
+        for engine in &self.engines {
+            engine.reset_after_adapter_tdr();
+        }
     }
 
     fn display_equal(a: &commands::DisplayOne, b: &commands::DisplayOne) -> bool {
@@ -1904,6 +2031,10 @@ impl GpuChannel {
 
     pub fn dxgk_interface(&self) -> &DxgkInterface {
         &self.data.interface
+    }
+
+    pub fn is_resetting(&self) -> bool {
+        self.data.resetting.load(Ordering::Acquire)
     }
 
     pub fn kick(&self) {
@@ -2577,6 +2708,10 @@ impl QueueHandler {
         self.data.cached_edid(scanout)
     }
 
+    pub fn is_resetting(&self) -> bool {
+        self.data.resetting.load(Ordering::Acquire)
+    }
+
     pub fn get_shmem_slice(&self) -> (u64, u64) {
         let phys = self.data.interface.get_physical_bar_address(self.data.shmem.bar).unwrap() + self.data.shmem.offset;
         let size = self.data.shmem.length;
@@ -2684,6 +2819,8 @@ impl QueueHandler {
     }
 
     pub fn start_handler_thread(&mut self) -> Result<(), NtStatus> {
+        self.thread.events().stop.clear();
+
         let thread_routine = |h: &mut Self| {
             info!("running queue handler thread");
             h.handler_thread_routine();
@@ -2695,6 +2832,81 @@ impl QueueHandler {
         self.thread.start(thread_routine, context)?;
 
         Ok(())
+    }
+
+    fn stop_handler_thread(&mut self) -> Result<(), NtStatus> {
+        self.thread.stop();
+        if let Some(thread) = self.thread.thread().take() {
+            thread.join(NtTime::INFINITE)?;
+        }
+        Ok(())
+    }
+
+    pub fn begin_reset_from_timeout(&self) {
+        self.data.resetting.store(true, Ordering::Release);
+        self.control.chan.set_enabled(false);
+        self.cursor.chan.set_enabled(false);
+    }
+
+    pub fn reset_from_timeout(&mut self) -> Result<(), NtStatus> {
+        self.begin_reset_from_timeout();
+
+        self.stop_handler_thread()?;
+
+        /*
+         * Do not release any buffers that are still described by the old
+         * virtqueues until the device has acknowledged reset. Before that
+         * point the host is still allowed to access their DMA memory.
+         */
+        self.pci_transport.set_status(DeviceStatus::empty());
+        let (start, frequency) = ke_query_performance_counter();
+        while self.pci_transport.get_status() != DeviceStatus::empty() {
+            let (now, _) = ke_query_performance_counter();
+            if now.saturating_sub(start) >= frequency {
+                error!("{}: virtio device reset timed out", function!());
+                return Err(NtStatus(STATUS::IO_DEVICE_ERROR));
+            }
+            core::hint::spin_loop();
+        }
+
+        self.control.abort_all(&self.data);
+        self.cursor.abort_all(&self.data);
+        self.data.reset_after_adapter_tdr();
+
+        Ok(())
+    }
+
+    pub fn restart_from_timeout(&mut self, expected_features: Features) -> Result<(), NtStatus> {
+        let negotiated_features = self.pci_transport.begin_init(expected_features);
+        if negotiated_features != expected_features {
+            error!(
+                "{}: feature set changed after reset: expected {:?}, got {:?}",
+                function!(),
+                expected_features,
+                negotiated_features,
+            );
+            return Err(NtStatus(STATUS::DEVICE_CONFIGURATION_ERROR));
+        }
+
+        let access_platform = negotiated_features.contains(Features::ACCESS_PLATFORM);
+        let indirect = negotiated_features.contains(Features::RING_INDIRECT_DESC);
+        let event_idx = negotiated_features.contains(Features::RING_EVENT_IDX);
+
+        self.control.reinitialize(&mut self.pci_transport, access_platform, indirect, event_idx)?;
+        self.cursor.reinitialize(&mut self.pci_transport, access_platform, indirect, event_idx)?;
+        self.data.restart_after_adapter_tdr();
+        self.pci_transport.finish_init();
+
+        self.start_handler_thread()?;
+        self.control.chan.set_enabled(true);
+        self.cursor.chan.set_enabled(true);
+
+        Ok(())
+    }
+
+    pub fn finish_restart_from_timeout(&self) {
+        self.data.resetting.store(false, Ordering::Release);
+        self.kick();
     }
 
     pub fn ack_interrupt(&mut self) {

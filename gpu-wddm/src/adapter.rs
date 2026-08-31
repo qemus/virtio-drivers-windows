@@ -1315,6 +1315,9 @@ impl Adapter {
             addrs,
             flipq,
             vsync_enabled,
+            callback_active: AtomicBool::new(false),
+            callback_count: AtomicU64::new(0),
+            timer_armed: AtomicBool::new(false),
             last_vblank_timestamp,
             refresh_num,
             refresh_den,
@@ -1915,6 +1918,72 @@ impl Adapter {
         result
     }
 
+    pub fn reset_from_timeout(&mut self) -> Result<(), NtStatus> {
+        trace!("{}", function!());
+
+        {
+            let state = check_state!(self)?;
+            state.queue_handler.begin_reset_from_timeout();
+        }
+
+        if let Some(flip_timer) = self.flip_timer.as_ref() {
+            flip_timer.reset_after_tdr();
+        }
+
+        let state = check_state_mut!(self)?;
+        state.empty_cursor.take();
+        for output in state.outputs.iter().flatten() {
+            output.reset_after_tdr();
+        }
+
+        state.queue_handler.reset_from_timeout()
+    }
+
+    pub fn restart_from_timeout(&mut self) -> Result<(), NtStatus> {
+        trace!("{}", function!());
+
+        let num_scanouts = {
+            let state = check_state_mut!(self)?;
+            let features = state.negotiated_features;
+            state.queue_handler.restart_from_timeout(features)?;
+
+            let chan = state.queue_handler.channel();
+            let display_modes = chan.get_display_info()?;
+            chan.cache_display_info(display_modes);
+
+            for scanout in 0..state.num_scanouts as usize {
+                if display_modes[scanout].enabled != 0 {
+                    let edid = chan.get_edid(scanout as u32)?;
+                    chan.cache_edid(scanout, &edid)?;
+                }
+            }
+
+            state.empty_cursor = Some(Cursor::try_new(&chan, 64, 64, 0, 0, 0, 0)?);
+
+            state.num_scanouts
+        };
+
+        for scanout in 0..num_scanouts as usize {
+            self.refresh_output_from_cache(scanout)?;
+        }
+
+        let refresh_rate = {
+            let state = check_state!(self)?;
+            Self::active_refresh_rate(state)
+        };
+
+        {
+            let state = check_state!(self)?;
+            state.queue_handler.finish_restart_from_timeout();
+        }
+
+        if let Some(flip_timer) = self.flip_timer.as_ref() {
+            flip_timer.start(refresh_rate)?;
+        }
+
+        Ok(())
+    }
+
     pub fn stop_and_release(&mut self) -> Result<DXGK_DISPLAY_INFORMATION, NtStatus> {
         trace!("{}", function!());
         let state = check_state!(self)?;
@@ -1930,6 +1999,10 @@ impl Adapter {
         let Ok(state) = check_state_mut!(self) else {
             return false;
         };
+
+        if state.queue_handler.is_resetting() {
+            return false;
+        }
 
         if state.is_msi {
             // TODO: should we implement MSI-X?
@@ -1947,6 +2020,11 @@ impl Adapter {
         let Ok(state) = check_state!(self) else {
             return;
         };
+
+        if state.queue_handler.is_resetting() {
+            state.queue_handler.dxgk_interface().notify_dpc();
+            return;
+        }
 
         state.queue_handler.handle_dpc();
         state.queue_handler.dxgk_interface().notify_dpc();

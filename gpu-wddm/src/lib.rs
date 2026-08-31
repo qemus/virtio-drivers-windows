@@ -222,11 +222,8 @@ pub unsafe extern "C" fn driver_entry(
     initial_data.DxgkDdiPreemptCommand = Some(preempt_command);
     initial_data.DxgkDdiResetFromTimeout = Some(reset_from_timeout);
     initial_data.DxgkDdiRestartFromTimeout = Some(restart_from_timeout);
-    initial_data.DxgkDdiQueryDependentEngineGroup = Some(query_dependent_engine_group);
     initial_data.DxgkDdiCollectDbgInfo = Some(collect_dbg_info);
     initial_data.DxgkDdiQueryCurrentFence = Some(query_current_fence);
-    initial_data.DxgkDdiQueryEngineStatus = Some(query_engine_status);
-    initial_data.DxgkDdiResetEngine = Some(reset_engine);
     //initial_data.DxgkDdiCancelCommand = Some(cancel_command);
 
     initial_data.DxgkDdiControlInterrupt = Some(control_interrupt);
@@ -1663,15 +1660,29 @@ unsafe extern "C" fn collect_dbg_info(adapter: HANDLE, collect_dbg_info: *const 
 }
 
 unsafe extern "C" fn reset_from_timeout(adapter: HANDLE) -> NTSTATUS {
-    error!("{}: not implemented", function!());
+    warn!("{}", function!());
+    let gpu = check_handle!(adapter: Adapter);
 
-    STATUS::NOT_IMPLEMENTED.to_u32()
+    match gpu.reset_from_timeout() {
+        Ok(()) => STATUS::SUCCESS,
+        Err(e) => {
+            error!("{}: failed to reset adapter: {:?}", function!(), e);
+            e.0
+        },
+    }.to_u32()
 }
 
 unsafe extern "C" fn restart_from_timeout(adapter: HANDLE) -> NTSTATUS {
-    error!("{}: not implemented", function!());
+    warn!("{}", function!());
+    let gpu = check_handle!(adapter: Adapter);
 
-    STATUS::NOT_IMPLEMENTED.to_u32()
+    match gpu.restart_from_timeout() {
+        Ok(()) => STATUS::SUCCESS,
+        Err(e) => {
+            error!("{}: failed to restart adapter: {:?}", function!(), e);
+            e.0
+        },
+    }.to_u32()
 }
 
 unsafe extern "C" fn control_interrupt2(adapter: HANDLE, interrupt_control: DXGKARG_CONTROLINTERRUPT2) -> NTSTATUS {
