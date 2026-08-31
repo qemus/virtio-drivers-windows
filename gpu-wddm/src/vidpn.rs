@@ -1636,6 +1636,42 @@ pub struct VidPnOutput {
 }
 
 impl VidPnOutput {
+    /// Decode the first EDID detailed timing descriptor locally until the
+    /// corresponding timing API is available from the upstream virtio-drivers
+    /// crate. Keeping this here avoids depending on an API that has not landed
+    /// upstream yet.
+    fn preferred_timing(edid: &Edid) -> Option<(u32, u32, u32, u32, u32)> {
+        const DTD1_OFFSET: usize = 0x36;
+        const DTD_LEN: usize = 18;
+
+        if edid.size < 128 {
+            return None;
+        }
+
+        let bytes = &edid.data[DTD1_OFFSET..DTD1_OFFSET + DTD_LEN];
+        let pixel_clock_10khz = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
+        if pixel_clock_10khz == 0 {
+            return None;
+        }
+
+        let width = bytes[2] as u32 | ((bytes[4] as u32 & 0xf0) << 4);
+        let h_blank = bytes[3] as u32 | ((bytes[4] as u32 & 0x0f) << 8);
+        let height = bytes[5] as u32 | ((bytes[7] as u32 & 0xf0) << 4);
+        let v_blank = bytes[6] as u32 | ((bytes[7] as u32 & 0x0f) << 8);
+
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        Some((
+            width,
+            height,
+            width + h_blank,
+            height + v_blank,
+            pixel_clock_10khz * 10_000,
+        ))
+    }
+
     fn build_modes(info: commands::DisplayOne, edid: &Edid) -> Vec<MonitorMode> {
         let preferred = if info.rect.width < 640 || info.rect.height < 480 {
             edid.preferred_resolution().unwrap()
@@ -1643,8 +1679,8 @@ impl VidPnOutput {
             (info.rect.width, info.rect.height)
         };
 
-        let preferred_mode = match edid.preferred_timing() {
-            Ok((width, height, total_width, total_height, pixel_clock_hz))
+        let preferred_mode = match Self::preferred_timing(edid) {
+            Some((width, height, total_width, total_height, pixel_clock_hz))
                 if (width, height) == preferred =>
             {
                 MonitorMode::from_detailed_timing(
