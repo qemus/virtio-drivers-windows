@@ -188,6 +188,97 @@ pub const PAGE_TABLE_DESC: [DXGK_PAGE_TABLE_LEVEL_DESC; 3] = [
 
 const _: () = assert!(core::mem::size_of::<PageTableEntry>() == 8);
 
+impl MemorySegment {
+    fn from_pte_segment(segment: u8) -> Self {
+        match segment {
+            0 => Self::ImplicitSystemMemory,
+            1 => Self::Aperture3D,
+            2 => Self::BlobMappable,
+            3 => Self::BlobHost3D,
+            _ => unreachable!("DXGK_PTE segment is a 2-bit field"),
+        }
+    }
+}
+
+impl PageTableEntry {
+    fn from_dxgk_pte(entry: &DXGK_PTE) -> Self {
+        let mut result = Self::new();
+        let valid = entry.Flags().Valid();
+
+        result.set_valid(valid);
+        if valid {
+            result.set_segment(MemorySegment::from_pte_segment(entry.Flags().Segment()));
+            result.set_address(entry.PageAddress());
+        }
+
+        result
+    }
+}
+
+/// Apply a WDDM GPU page-table update to the CPU-visible software page table.
+///
+/// VirtIO-GPU submissions reference host resources rather than dereferencing
+/// guest GPU virtual addresses, so the guest page tables are bookkeeping for
+/// VidMm. We still have to maintain the page-table memory exactly as advertised
+/// by DXGK_GPUMMUCAPS. In particular, paging-process initialization arrives
+/// with pDmaBuffer == NULL and must be completed synchronously.
+pub fn update_page_table_cpu(update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE) -> Result<(), NtStatus> {
+    if update.UpdateMode != DXGK_PAGETABLEUPDATEMODE::DXGK_PAGETABLEUPDATE_CPU_VIRTUAL {
+        error!("{}: unsupported page-table update mode: {:?}", function!(), update.UpdateMode);
+        return Err(NtStatus(STATUS::NOT_SUPPORTED));
+    }
+
+    let level = update.PageTableLevel as usize;
+    let Some(level_desc) = PAGE_TABLE_DESC.get(level) else {
+        error!("{}: invalid page-table level {}", function!(), update.PageTableLevel);
+        return Err(NtStatus(STATUS::INVALID_PARAMETER));
+    };
+
+    if update.NumPageTableEntries == 0 {
+        return Ok(());
+    }
+
+    if update.pPageTableEntries.is_null() {
+        error!("{}: page-table entry source is null", function!());
+        return Err(NtStatus(STATUS::INVALID_PARAMETER));
+    }
+
+    let page_table = unsafe { update.PageTableAddress.__bindgen_anon_1.CpuVirtual } as *mut PageTableEntry;
+    if page_table.is_null() {
+        error!("{}: CPU virtual page-table address is null", function!());
+        return Err(NtStatus(STATUS::INVALID_PARAMETER));
+    }
+
+    let table_entry_count = 1usize
+        .checked_shl(level_desc.PageTableIndexBitCount)
+        .ok_or(NtStatus(STATUS::INVALID_PARAMETER))?;
+    let start = update.StartIndex as usize;
+    let count = update.NumPageTableEntries as usize;
+    let end = start
+        .checked_add(count)
+        .ok_or(NtStatus(STATUS::INVALID_PARAMETER))?;
+
+    if end > table_entry_count {
+        error!(
+            "{}: page-table update [{}..{}) exceeds level {} entry count {}",
+            function!(),
+            start,
+            end,
+            update.PageTableLevel,
+            table_entry_count,
+        );
+        return Err(NtStatus(STATUS::INVALID_PARAMETER));
+    }
+
+    for i in 0..count {
+        let src = unsafe { &*update.pPageTableEntries.add(i) };
+        let dst = unsafe { page_table.add(start + i) };
+        unsafe { dst.write(PageTableEntry::from_dxgk_pte(src)); }
+    }
+
+    Ok(())
+}
+
 #[repr(C)]
 #[derive(Tagged)]
 #[tagged(VIRTIO_GPU_PROCESS_TAG)]

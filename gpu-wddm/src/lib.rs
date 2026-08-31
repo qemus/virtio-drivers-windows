@@ -243,8 +243,9 @@ pub unsafe extern "C" fn driver_entry(
     initial_data.DxgkDdiSubmitCommandVirtual = Some(submit_command_virtual);
     initial_data.DxgkDdiSetRootPageTable = Some(set_root_page_table);
     initial_data.DxgkDdiGetRootPageTableSize = Some(get_root_page_table_size);
-    initial_data.DxgkDdiMapCpuHostAperture = Some(map_cpu_host_aperture);
-    initial_data.DxgkDdiUnmapCpuHostAperture = Some(unmap_cpu_host_aperture);
+    // No CPU host aperture is exposed by this driver, so do not register
+    // callbacks that can only return NOT_IMPLEMENTED. CPU-visible blob memory
+    // is described directly through the segment's translated CPU address.
     initial_data.DxgkDdiCheckMultiPlaneOverlaySupport2 = Some(check_multiplane_overlay_support2);
     initial_data.DxgkDdiCreateProcess = Some(create_process);
     initial_data.DxgkDdiDestroyProcess = Some(destroy_process);
@@ -844,7 +845,20 @@ unsafe extern "C" fn build_paging_buffer(adapter: HANDLE, build_paging_buffer: *
     let gpu = check_handle!(adapter: Adapter);
     let build_paging_buffer = check_arg!(mut build_paging_buffer);
 
-    if build_paging_buffer.pDmaBuffer.is_null() {
+    if build_paging_buffer.Operation == DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_UPDATE_PAGE_TABLE {
+        let update = unsafe { (*build_paging_buffer).__bindgen_anon_1.UpdatePageTable };
+        if let Err(e) = update_page_table_cpu(&update) {
+            return e.to_u32();
+        }
+
+        // Paging-process page-table initialization is explicitly delivered
+        // with no DMA buffer and must be completed synchronously. For normal
+        // updates, continue below so allocation residency/backing bookkeeping
+        // can still emit the required VirtIO resource commands.
+        if build_paging_buffer.pDmaBuffer.is_null() {
+            return STATUS::SUCCESS.to_u32();
+        }
+    } else if build_paging_buffer.pDmaBuffer.is_null() {
         warn!("{} ({:?}): dma buffer is null", function!(), build_paging_buffer.Operation);
         return STATUS::SUCCESS.to_u32();
     }
@@ -1031,6 +1045,8 @@ unsafe extern "C" fn build_paging_buffer(adapter: HANDLE, build_paging_buffer: *
 
             trace!("{}: update page table: {:?}", function!(), update);
             if update.hAllocation.is_null() {
+                // Implicit page-table/page-directory update. The CPU-visible
+                // table contents were already written before DMA handling.
                 return STATUS::SUCCESS.to_u32();
             }
 
@@ -1788,23 +1804,45 @@ unsafe extern "C" fn set_root_page_table(adapter: HANDLE, set_page_table: *const
         return;
     }
 
-    let set_page_table = unsafe { *set_page_table };
-    debug!("{}: stub: {:?}", function!(), set_page_table);
+    let set_page_table = unsafe { &*set_page_table };
+    let Some(context): Option<&DeviceContext> = TaggedExt::from_handle_silent(set_page_table.hContext) else {
+        error!("{}: invalid context {:?}", function!(), set_page_table.hContext);
+        return;
+    };
+
+    context.set_root_page_table(set_page_table.Address, set_page_table.NumEntries);
+    debug!("{}: context {:?}: {:?}, entries {}", function!(), set_page_table.hContext, set_page_table.Address, set_page_table.NumEntries);
 }
 
 unsafe extern "C" fn get_root_page_table_size(adapter: HANDLE, get_root_page_table_size: *mut DXGKARG_GETROOTPAGETABLESIZE) -> u64 {
-    warn!("{}: stub", function!());
-    0
-}
+    if get_root_page_table_size.is_null() {
+        warn!("{}: args are null", function!());
+        return 0;
+    }
 
-unsafe extern "C" fn map_cpu_host_aperture(adapter: HANDLE, map_aperture: *const DXGKARG_MAPCPUHOSTAPERTURE) -> NTSTATUS {
-    error!("{}: not implemented", function!());
-    STATUS::NOT_IMPLEMENTED.to_u32()
-}
+    let args = unsafe { &mut *get_root_page_table_size };
+    const ENTRY_SIZE: u64 = core::mem::size_of::<PageTableEntry>() as u64;
+    const PAGE_SIZE_BYTES: u64 = 4096;
 
-unsafe extern "C" fn unmap_cpu_host_aperture(adapter: HANDLE, unmap_aperture: *const DXGKARG_UNMAPCPUHOSTAPERTURE) -> NTSTATUS {
-    error!("{}: not implemented", function!());
-    STATUS::NOT_IMPLEMENTED.to_u32()
+    let requested_entries = u64::from(args.NumberOfPte.max(1));
+    let Some(raw_size) = requested_entries.checked_mul(ENTRY_SIZE) else {
+        error!("{}: root page-table size overflow for {} entries", function!(), args.NumberOfPte);
+        return 0;
+    };
+    let Some(rounded) = raw_size.checked_add(PAGE_SIZE_BYTES - 1) else {
+        error!("{}: root page-table alignment overflow", function!());
+        return 0;
+    };
+    let size = (rounded / PAGE_SIZE_BYTES) * PAGE_SIZE_BYTES;
+    let actual_entries = size / ENTRY_SIZE;
+
+    if actual_entries > u32::MAX as u64 {
+        error!("{}: root page-table entry count overflow: {}", function!(), actual_entries);
+        return 0;
+    }
+
+    args.NumberOfPte = actual_entries as u32;
+    size
 }
 
 unsafe extern "C" fn check_multiplane_overlay_support(adapter: HANDLE, check_multiplane_overlay_support: *mut DXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT) -> NTSTATUS {

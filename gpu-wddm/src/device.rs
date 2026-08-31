@@ -9,6 +9,11 @@ use core::{
     iter::zip,
     mem::transmute,
     fmt,
+    sync::atomic::{
+        AtomicU32,
+        AtomicU64,
+        Ordering,
+    },
 };
 
 use alloc::{
@@ -142,6 +147,30 @@ pub struct DeviceContext {
     pub tag: u64,
     pub device: Arc<Device>,
     pub engine: Engine,
+    root_page_table_segment: AtomicU32,
+    root_page_table_offset: AtomicU64,
+    root_page_table_entries: AtomicU32,
+}
+
+impl DeviceContext {
+    pub fn set_root_page_table(&self, address: D3DGPU_PHYSICAL_ADDRESS, num_entries: u32) {
+        // DxgkDdiSetRootPageTable is level-1 synchronized and the context is
+        // guaranteed idle, but atomics keep readers lock-free if we later use
+        // this state from a submission path. Publish the entry count last.
+        self.root_page_table_entries.store(0, Ordering::Release);
+        self.root_page_table_segment.store(address.SegmentId, Ordering::Relaxed);
+        self.root_page_table_offset.store(address.SegmentOffset, Ordering::Relaxed);
+        self.root_page_table_entries.store(num_entries, Ordering::Release);
+    }
+
+    pub fn root_page_table(&self) -> (D3DGPU_PHYSICAL_ADDRESS, u32) {
+        let num_entries = self.root_page_table_entries.load(Ordering::Acquire);
+        let address = D3DGPU_PHYSICAL_ADDRESS {
+            SegmentId: self.root_page_table_segment.load(Ordering::Relaxed),
+            SegmentOffset: self.root_page_table_offset.load(Ordering::Relaxed),
+        };
+        (address, num_entries)
+    }
 }
 
 impl fmt::Debug for Device {
@@ -169,6 +198,9 @@ impl Device {
             tag: VIRTIO_GPU_CONTEXT_TAG,
             device: self.clone(),
             engine,
+            root_page_table_segment: AtomicU32::new(0),
+            root_page_table_offset: AtomicU64::new(0),
+            root_page_table_entries: AtomicU32::new(0),
         })?)
     }
 
