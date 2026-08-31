@@ -92,47 +92,23 @@ impl StandardTiming {
 struct DetailedTiming {
     /// Horizontal active pixels.
     h_active: u32,
-    /// Horizontal blanking pixels.
-    h_blank: u32,
     /// Vertical active pixels.
     v_active: u32,
-    /// Vertical blanking lines.
-    v_blank: u32,
-    /// Pixel clock in Hz.
-    pixel_clock_hz: u32,
 }
 
 impl DetailedTiming {
     /// Parse a detailed timing descriptor from its 18-byte encoding.
     ///
-    /// Returns `None` for a display descriptor (zero pixel clock), or if
-    /// the active pixel counts are zero.
+    /// Returns `None` if the active pixel counts are zero.
     fn parse(bytes: &[u8; DTD_LEN]) -> Option<Self> {
-        let pixel_clock_10khz = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
-        if pixel_clock_10khz == 0 {
-            return None;
-        }
-
         // Horizontal active: lower 8 bits at byte 2, upper 4 bits in high nibble of byte 4.
         let h_active = bytes[2] as u32 | ((bytes[4] as u32 & 0xF0) << 4);
-        // Horizontal blanking: lower 8 bits at byte 3, upper 4 bits in low nibble of byte 4.
-        let h_blank = bytes[3] as u32 | ((bytes[4] as u32 & 0x0F) << 8);
         // Vertical active: lower 8 bits at byte 5, upper 4 bits in high nibble of byte 7.
         let v_active = bytes[5] as u32 | ((bytes[7] as u32 & 0xF0) << 4);
-        // Vertical blanking: lower 8 bits at byte 6, upper 4 bits in low nibble of byte 7.
-        let v_blank = bytes[6] as u32 | ((bytes[7] as u32 & 0x0F) << 8);
-
         if h_active == 0 || v_active == 0 {
             return None;
         }
-
-        Some(Self {
-            h_active,
-            h_blank,
-            v_active,
-            v_blank,
-            pixel_clock_hz: pixel_clock_10khz * 10_000,
-        })
+        Some(Self { h_active, v_active })
     }
 }
 
@@ -169,28 +145,13 @@ impl Edid {
         StandardTiming::parse(bytes)
     }
 
-    /// Get the preferred detailed timing from the EDID data.
-    ///
-    /// Returns (active width, active height, total width, total height, pixel clock in Hz)
-    /// from the first Detailed Timing Descriptor.
-    pub fn preferred_timing(&self) -> Result<(u32, u32, u32, u32, u32)> {
-        let dtd = self.first_detailed_timing().ok_or(Error::IoError)?;
-        Ok((
-            dtd.h_active,
-            dtd.v_active,
-            dtd.h_active + dtd.h_blank,
-            dtd.v_active + dtd.v_blank,
-            dtd.pixel_clock_hz,
-        ))
-    }
-
     /// Get the preferred resolution from the EDID data.
     ///
     /// Returns the resolution from the first Detailed Timing Descriptor,
     /// which per the EDID spec represents the display's preferred mode.
     pub fn preferred_resolution(&self) -> Result<(u32, u32)> {
-        let (width, height, _, _, _) = self.preferred_timing()?;
-        Ok((width, height))
+        let dtd = self.first_detailed_timing().ok_or(Error::IoError)?;
+        Ok((dtd.h_active, dtd.v_active))
     }
 
     /// Get the list of supported resolutions from EDID standard timings.
@@ -217,7 +178,7 @@ mod tests {
     /// Real EDID captured from QEMU virtio-GPU with `-device virtio-gpu,xres=1920,yres=1080`.
     /// QEMU generates this EDID dynamically. The base block (bytes 0-127) contains:
     /// - Manufacturer: "RHT" (Red Hat), product code 0x1234
-    /// - DTD1 preferred mode: 1920x1080 @ ~75Hz
+    /// - DTD1 preferred mode: 1920x1080 @ 60Hz
     /// - 8 Standard Timings: 2048x1152, 1920x1080, 1920x1200, 1600x1200,
     ///   1680x1050, 1440x900, 1280x1024, 1280x960
     /// - CEA extension block (bytes 128-255) with SVDs for additional modes
@@ -327,10 +288,7 @@ mod tests {
     fn detailed_timing_known_1920x1080() {
         let dtd = DetailedTiming::parse(&qemu_dtd1_bytes()).unwrap();
         assert_eq!(dtd.h_active, 1920);
-        assert_eq!(dtd.h_blank, 672);
         assert_eq!(dtd.v_active, 1080);
-        assert_eq!(dtd.v_blank, 37);
-        assert_eq!(dtd.pixel_clock_hz, 217_140_000);
     }
 
     #[test]
@@ -370,22 +328,6 @@ mod tests {
         let edid = make_edid(qemu_edid(), 256);
         let (w, h) = edid.preferred_resolution().unwrap();
         assert_eq!((w, h), (1920, 1080));
-    }
-
-    #[test]
-    fn qemu_edid_preferred_timing() {
-        let edid = make_edid(qemu_edid(), 256);
-        let (width, height, total_width, total_height, pixel_clock_hz) =
-            edid.preferred_timing().unwrap();
-
-        assert_eq!((width, height), (1920, 1080));
-        assert_eq!((total_width, total_height), (2592, 1117));
-        assert_eq!(pixel_clock_hz, 217_140_000);
-
-        let total_pixels = total_width as u64 * total_height as u64;
-        let refresh_millihz =
-            (pixel_clock_hz as u64 * 1000 + total_pixels / 2) / total_pixels;
-        assert_eq!(refresh_millihz, 74_998);
     }
 
     #[test]
