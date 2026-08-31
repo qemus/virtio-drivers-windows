@@ -1380,11 +1380,15 @@ impl Adapter {
                 //driver_caps.WDDMVersion = DXGK_WDDMVERSION::DXGKDDI_WDDMv1_3;
                 driver_caps.HighestAcceptableAddress.QuadPart = -1i64;
 
-                //driver_caps.PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_GRANULARITY::D3DKMDT_GRAPHICS_PREEMPTION_NONE;
-                //driver_caps.PreemptionCaps.ComputePreemptionGranularity = D3DKMDT_COMPUTE_PREEMPTION_GRANULARITY::D3DKMDT_COMPUTE_PREEMPTION_NONE;
-
-                driver_caps.PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_GRANULARITY::D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
-                driver_caps.PreemptionCaps.ComputePreemptionGranularity = D3DKMDT_COMPUTE_PREEMPTION_GRANULARITY::D3DKMDT_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
+                /*
+                 * VirtIO-GPU commands already submitted to the control virtqueue
+                 * cannot be cancelled. That means the driver cannot guarantee the
+                 * pending-command suppression required for DMA-buffer-boundary
+                 * preemption. Report the actual capability instead of asking VidSch
+                 * to use a preemption/resubmission path we cannot implement.
+                 */
+                driver_caps.PreemptionCaps.GraphicsPreemptionGranularity = D3DKMDT_GRAPHICS_PREEMPTION_GRANULARITY::D3DKMDT_GRAPHICS_PREEMPTION_NONE;
+                driver_caps.PreemptionCaps.ComputePreemptionGranularity = D3DKMDT_COMPUTE_PREEMPTION_GRANULARITY::D3DKMDT_COMPUTE_PREEMPTION_NONE;
 
                 /* I don't think we can realistically support this:
                    > No generation of a DMA buffer to pass in a call to its DxgkDdiPresent function (that is, NULL is passed in the pDmaBuffer member of the DXGKARG_PRESENT structure).
@@ -1414,7 +1418,7 @@ impl Adapter {
                 driver_caps.SupportPerEngineTDR = false as _;
                 driver_caps.SupportDirectFlip = true as _;
                 driver_caps.SchedulingCaps.set_MultiEngineAware(true);
-                driver_caps.SchedulingCaps.set_PreemptionAware(true);
+                driver_caps.SchedulingCaps.set_PreemptionAware(false);
                 // TODO: 15 seems to be the max as this is u4
                 //driver_caps.SchedulingCaps.set_HwQueuePacketCap(0);
 
