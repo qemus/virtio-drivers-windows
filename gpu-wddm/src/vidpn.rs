@@ -9,6 +9,7 @@ use core::{
         DerefMut,
     },
     sync::atomic::{
+        AtomicU32,
         AtomicU64,
         AtomicPtr,
         AtomicBool,
@@ -29,6 +30,7 @@ use wdk::{
     wdm::{
         KeTimer,
         NtTime,
+        ke_query_performance_counter,
     },
     *,
 };
@@ -1021,6 +1023,59 @@ impl MonitorMode {
         info.ColorBasis = D3DKMDT_COLOR_BASIS::D3DKMDT_CB_SCRGB;
         info.PixelValueAccessMode = D3DKMDT_PIXEL_VALUE_ACCESS_MODE::D3DKMDT_PVAM_DIRECT;
     }
+
+    /// Convert elapsed performance-counter ticks since the start of vertical
+    /// blank into the raster state Windows expects from DxgkDdiGetScanLine.
+    pub fn raster_status(
+        &self,
+        elapsed_ticks: u64,
+        frequency: u64,
+        refresh_rate: (u32, u32),
+    ) -> Option<(bool, u32)> {
+        if self.height == 0 || self.total_height == 0 || frequency == 0 {
+            return None;
+        }
+
+        let (refresh_num, refresh_den) = refresh_rate;
+        if refresh_num == 0 || refresh_den == 0 {
+            return None;
+        }
+
+        let frame_ticks = (frequency as u128)
+            .checked_mul(refresh_den as u128)?
+            .checked_add((refresh_num as u128) / 2)?
+            / refresh_num as u128;
+
+        if frame_ticks == 0 || frame_ticks > u64::MAX as u128 {
+            return None;
+        }
+
+        let frame_ticks = frame_ticks as u64;
+        let phase_ticks = elapsed_ticks % frame_ticks;
+
+        /*
+         * The emulated VSync timer marks entry into VBLANK. For a complete
+         * detailed timing, treat the vertical blanking lines as preceding
+         * active scan line 0. For fallback modes where blanking information
+         * is unavailable, report an active scanline approximation.
+         */
+        if self.total_height > self.height {
+            let raster_line = ((phase_ticks as u128 * self.total_height as u128)
+                / frame_ticks as u128) as u32;
+            let blank_lines = self.total_height - self.height;
+
+            if raster_line < blank_lines {
+                return Some((true, 0));
+            }
+
+            return Some((false, (raster_line - blank_lines).min(self.height - 1)));
+        }
+
+        let scan_line = ((phase_ticks as u128 * self.height as u128)
+            / frame_ticks as u128) as u32;
+
+        Some((false, scan_line.min(self.height - 1)))
+    }
 }
 
 pub struct FlipTimerContext {
@@ -1029,6 +1084,9 @@ pub struct FlipTimerContext {
     //pub addrs: [(AtomicU64, AtomicPtr<Allocation>); 16],
     pub flipq: [Option<Arc<ArrayQueue<(Weak<Allocation>, u64)>>>; 16],
     pub vsync_enabled: AtomicBool,
+    pub last_vblank_timestamp: AtomicU64,
+    pub refresh_num: AtomicU32,
+    pub refresh_den: AtomicU32,
     pub chan: GpuChannel,
 }
 
@@ -1036,6 +1094,9 @@ unsafe impl Send for FlipTimerContext {}
 
 impl FlipTimerContext {
     fn flip(&self) {
+        let (timestamp, _) = ke_query_performance_counter();
+        self.last_vblank_timestamp.store(timestamp, Ordering::Release);
+
         let mut scanouts = [None; 16];
         let mut scanout_sent = false;
 
@@ -1187,7 +1248,35 @@ impl FlipTimer {
             refresh_rate.1,
         );
 
+        /*
+         * ExSetTimer schedules the first callback one full period from now.
+         * Use the current timestamp as the preceding VBLANK boundary so
+         * GetScanLine has a defined phase immediately after start/reprogram.
+         */
+        self.inner.refresh_num.store(refresh_rate.0, Ordering::Release);
+        self.inner.refresh_den.store(refresh_rate.1, Ordering::Release);
+
+        let (timestamp, _) = ke_query_performance_counter();
+        self.inner.last_vblank_timestamp.store(timestamp, Ordering::Release);
+
         Ok(self.timer.start_periodic(period)?)
+    }
+
+    pub fn raster_status(&self, mode: &MonitorMode) -> Option<(bool, u32)> {
+        let last_vblank = self.inner.last_vblank_timestamp.load(Ordering::Acquire);
+        if last_vblank == 0 {
+            return None;
+        }
+
+        let refresh_rate = (
+            self.inner.refresh_num.load(Ordering::Acquire),
+            self.inner.refresh_den.load(Ordering::Acquire),
+        );
+
+        let (now, frequency) = ke_query_performance_counter();
+        let elapsed = now.saturating_sub(last_vblank);
+
+        mode.raster_status(elapsed, frequency, refresh_rate)
     }
 
     pub fn stop(&self) -> Result<(), NtStatus> {

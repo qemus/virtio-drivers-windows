@@ -1250,6 +1250,9 @@ impl Adapter {
         let mut flipq = [const { None }; 16];
         let addrs = [const { AtomicU64::new(0) }; 16];
         let vsync_enabled = AtomicBool::new(false);
+        let last_vblank_timestamp = AtomicU64::new(0);
+        let refresh_num = AtomicU32::new(0);
+        let refresh_den = AtomicU32::new(0);
         //let addrs = [const { (AtomicU64::new(0), AtomicPtr::new(null_mut())) }; 16];
 
         for scanout in 0..(num_scanouts as usize) {
@@ -1291,6 +1294,9 @@ impl Adapter {
             addrs,
             flipq,
             vsync_enabled,
+            last_vblank_timestamp,
+            refresh_num,
+            refresh_den,
             chan,
         }).inspect_err(|e|
             error!("{}: failed to create flip timer: {:?}", function!(), e)
@@ -2813,6 +2819,33 @@ impl Adapter {
                 warn!("{}: not implemented: {:?}", function!(), interrupt);
             },
         }
+    }
+
+    pub fn get_scan_line(
+        &self,
+        target: D3DDDI_VIDEO_PRESENT_TARGET_ID,
+    ) -> Result<(bool, u32), NtStatus> {
+        let state = check_state!(self)?;
+
+        if target >= state.num_scanouts as u32 {
+            return Err(NtStatus(STATUS::INVALID_PARAMETER));
+        }
+
+        let output = state.outputs[target as usize]
+            .as_ref()
+            .ok_or(STATUS::GRAPHICS_INVALID_VIDEO_PRESENT_TARGET)?;
+
+        let current_mode = output.current_mode
+            .ok_or(STATUS::GRAPHICS_INVALID_VIDEO_PRESENT_TARGET)?;
+
+        let mode = output.modes.get(current_mode)
+            .ok_or(STATUS::GRAPHICS_INVALID_VIDEO_PRESENT_TARGET)?;
+
+        let flip_timer = self.flip_timer.as_ref()
+            .ok_or(STATUS::DEVICE_NOT_READY)?;
+
+        flip_timer.raster_status(mode)
+            .ok_or(NtStatus(STATUS::DEVICE_NOT_READY))
     }
 
     pub fn queue_scanout(&self, source: D3DDDI_VIDEO_PRESENT_SOURCE_ID, alloc: &Arc<Allocation>, addr: u64) -> Result<(), NtStatus> {

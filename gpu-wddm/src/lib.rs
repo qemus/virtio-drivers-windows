@@ -1511,9 +1511,19 @@ unsafe extern "C" fn control_interrupt(adapter: HANDLE, interrupt_type: DXGK_INT
 }
 
 unsafe extern "C" fn get_scan_line(adapter: HANDLE, get_scan_line: *mut DXGKARG_GETSCANLINE) -> NTSTATUS {
-    error!("{}: not implemented", function!());
+    trace!("{}", function!());
 
-    STATUS::NOT_IMPLEMENTED.to_u32()
+    let gpu = check_handle!(adapter: Adapter);
+    let get_scan_line = check_arg!(mut get_scan_line);
+
+    match gpu.get_scan_line(get_scan_line.VidPnTargetId) {
+        Ok((in_vertical_blank, scan_line)) => {
+            get_scan_line.InVerticalBlank = in_vertical_blank as _;
+            get_scan_line.ScanLine = scan_line;
+            STATUS::SUCCESS.to_u32()
+        },
+        Err(e) => e.to_u32(),
+    }
 }
 
 unsafe extern "C" fn stop_device_and_release_post_display_ownership(adapter: HANDLE, target_id: D3DDDI_VIDEO_PRESENT_TARGET_ID, display_info: *mut DXGK_DISPLAY_INFORMATION) -> NTSTATUS {
