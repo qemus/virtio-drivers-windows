@@ -152,7 +152,11 @@ impl<T> BlockingBufferInner<T> {
     }
 }
 
-// TODO: async resource / context creation
+/*
+ * Requests that must return host-created data or a definitive creation error
+ * still use BlockingBuffer.  Ordering-only resource/context lifetime changes
+ * use ordered asynchronous control-queue barriers instead.
+ */
 #[repr(transparent)]
 #[derive(Clone)]
 struct BlockingBuffer<T>(Pin<Arc<BlockingBufferInner<T>>>);
@@ -246,6 +250,7 @@ enum Callback<const MAX_INLINE: usize> {
     //SetEvent(NonNull<KeEvent>, Option<NonNull<MaybeUninit<MaybeInlineBuffer<MAX_INLINE>>>>, CancellationSignal),
     FreeContextId(NonZero<u32>),
     FreeResourceId(NonZero<u32>),
+    FreeBlobOffset(offset_allocator::Allocation),
     DmaCompleted(Engine, u32),
     DmaCompletedWithAllocations(Engine, u32, AllocationsBatch),
     DmaCompletedBatched(Engine, u32, Arc<AllocationsBatch>),
@@ -286,6 +291,7 @@ impl<const MAX_INLINE: usize> Callback<MAX_INLINE> {
             },
             Self::FreeContextId(id) => data.context_id.free(id.get()),
             Self::FreeResourceId(id) => data.resource_id.free(id.get()),
+            Self::FreeBlobOffset(offset) => data.offset_allocator.lock().free(offset),
             Self::DmaCompleted(_, _) => {},
             Self::DmaCompletedWithAllocations(_, _, allocations) => drop(allocations),
             Self::DmaCompletedBatched(_, _, allocations) => drop(allocations),
@@ -532,6 +538,7 @@ struct Buffer<const IN: usize, const OUT: usize> {
     input: MaybeInlineBuffer<IN>,
     output: MaybeInlineBuffer<OUT>,
     callback: Callback<OUT>,
+    ordered: bool,
 }
 //const _: () = assert!(size_of::<Option<Buffer<128, 64>>>() == 240);
 
@@ -539,6 +546,7 @@ struct Buffers<const BUFFERS: usize, const IN: usize, const OUT: usize> {
     inputs: AlignedBox<[Option<MaybeInlineBuffer<IN>>; BUFFERS]>,
     outputs: AlignedBox<[Option<MaybeInlineBuffer<OUT>>; BUFFERS]>,
     callbacks: [Callback<OUT>; BUFFERS],
+    ordered: [bool; BUFFERS],
     indices: [Option<usize>; BUFFERS],
 }
 
@@ -547,8 +555,9 @@ impl<const BUFFERS: usize, const IN: usize, const OUT: usize> Buffers<BUFFERS, I
         init!(Self {
             inputs: box_try_init_in(init_array_from_fn(|i| None), AlignedAlloc)?,
             outputs: box_try_init_in(init_array_from_fn(|i| None), AlignedAlloc)?,
-            callbacks <- init_array_from_fn(|i| Callback::None),
-            indices <- init_array_from_fn(|i| None),
+            callbacks <- init_array_from_fn(|_| Callback::None),
+            ordered: [false; BUFFERS],
+            indices <- init_array_from_fn(|_| None),
         }? NtStatus)
     }
 }
@@ -634,6 +643,14 @@ struct Queue<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize
     //chan: Pin<Arc<AsyncQueue<Buffer<IN, OUT>>>>,
     chan: QueueChannel<IN, OUT>,
 
+    /*
+     * Ordered requests are full control-queue barriers.  They are used for
+     * resource/context lifetime operations that don't need to block the
+     * calling WDDM thread but still must complete before later GPU work.
+     */
+    ordered_inflight: bool,
+    deferred: Option<Buffer<IN, OUT>>,
+
     //last_submitted_fence: AtomicU64,
 }
 
@@ -655,9 +672,28 @@ impl<const IN: usize, const OUT: usize> QueueChannel<IN, OUT> {
             return Err(NtStatus(STATUS::DEVICE_NOT_READY));
         }
 
-        self.0.push(Buffer { input, output, callback });
+        self.0.push(Buffer { input, output, callback, ordered: false });
         self.0.active_producers.fetch_sub(1, Ordering::Release);
         Ok(())
+    }
+
+    pub fn request_ordered_async_buf(&self, input: MaybeInlineBuffer<IN>, output: MaybeInlineBuffer<OUT>, callback: Callback<OUT>) -> Result<(), NtStatus> {
+        self.0.active_producers.fetch_add(1, Ordering::AcqRel);
+
+        if !self.0.enabled.load(Ordering::Acquire) {
+            self.0.active_producers.fetch_sub(1, Ordering::Release);
+            return Err(NtStatus(STATUS::DEVICE_NOT_READY));
+        }
+
+        self.0.push(Buffer { input, output, callback, ordered: true });
+        self.0.active_producers.fetch_sub(1, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn request_ordered_async<Req: IntoBytes + Immutable + KnownLayout, Rsp: FromBytes + IntoBytes + KnownLayout>(&self, req: Req, callback: Callback<OUT>) -> Result<(), NtStatus> {
+        let input = MaybeInlineBuffer::try_from_value(req)?;
+        let output = MaybeInlineBuffer::try_new_zeroed::<Rsp>()?;
+        self.request_ordered_async_buf(input, output, callback)
     }
 
     pub fn request_async_into_buf<Req: IntoBytes + Immutable + KnownLayout>(&self, req: Req, output: MaybeInlineBuffer<OUT>, callback: Callback<OUT>) -> Result<(), NtStatus> {
@@ -793,6 +829,8 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
             queue <- init_queue,
             buffers <- Buffers::new(),
             chan: QueueChannel::try_new(FAST)?,
+            ordered_inflight: false,
+            deferred: None,
             //fast: ArrayQueue::new(FAST),
             //slow: SegQueue::new(),
             //nop: SegQueue::new(),
@@ -802,6 +840,9 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
     }
 
     fn abort_all(&mut self, data: &GpuData) {
+        if let Some(buffer) = self.deferred.take() {
+            buffer.callback.abort(data);
+        }
         for buffer in self.chan.drain() {
             buffer.callback.abort(data);
         }
@@ -810,8 +851,10 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
             take(&mut self.buffers.callbacks[i]).abort(data);
             self.buffers.inputs[i].take();
             self.buffers.outputs[i].take();
+            self.buffers.ordered[i] = false;
             self.buffers.indices[i] = None;
         }
+        self.ordered_inflight = false;
 
         while self.free.pop().is_some() {}
         for i in 0..SIZE {
@@ -935,6 +978,7 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
         self.buffers.inputs[i] = Some(buffer.input);
         self.buffers.outputs[i] = Some(buffer.output);
         self.buffers.callbacks[i] = buffer.callback;
+        self.buffers.ordered[i] = buffer.ordered;
 
         let input = self.buffers.inputs[i].as_ref().unwrap().as_ref();
         let output = self.buffers.outputs[i].as_mut().unwrap().as_mut();
@@ -982,6 +1026,7 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
         self.buffers.inputs[i] = None;
         self.buffers.outputs[i] = None;
         self.buffers.callbacks[i] = Callback::None;
+        self.buffers.ordered[i] = false;
 
         //debug!("{}: pushing {} to the list of free virtio buffers ({} / {})", function!(), i, self.free.len(), SIZE);
         self.free.push(i).unwrap();
@@ -1046,20 +1091,42 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
     }
 
     fn request(&mut self, pci_transport: &mut PciTransport) -> Result<Option<()>, NtStatus> {
+        /*
+         * Once an ordered request reaches the device, no later request may be
+         * submitted until its fenced response arrives.  Likewise, wait for
+         * all earlier requests before submitting an ordered request.  This
+         * gives resource/context lifetime operations strict ordering without
+         * blocking their WDDM caller.
+         */
+        if self.ordered_inflight {
+            return Ok(None);
+        }
+
+        let buffer = if let Some(buffer) = self.deferred.take() {
+            buffer
+        } else {
+            let Some(buffer) = self.chan.0.pop() else {
+                return Ok(None);
+            };
+            buffer
+        };
+
+        if buffer.ordered && self.free.len() != SIZE {
+            self.deferred = Some(buffer);
+            return Ok(None);
+        }
+
         let Some(i) = self.free.pop() else {
+            self.deferred = Some(buffer);
             debug!("{}: virtio queue is full: {} / {}", function!(), self.free.len(), SIZE);
             return Ok(None);
         };
 
-        let Some(buffer) = self.chan.0.pop() else {
-            self.free.push(i).unwrap();
-            return Ok(None);
-        };
-
-        //warn!("{}: popped {} from the list of free virtio buffers ({} / {})", function!(), i, self.free.len(), SIZE);
-        //trace!("{}: got new buffer from queue", function!());
+        let ordered = buffer.ordered;
         self.push_to_device(pci_transport, i, buffer)?;
-        //trace!("{}: pushed buffer to device", function!());
+        if ordered {
+            self.ordered_inflight = true;
+        }
 
         Ok(Some(()))
     }
@@ -1085,6 +1152,7 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
         //trace!("response: device wrote {} bytes into buffer {}", len, i);
 
         let callback = take(&mut self.buffers.callbacks[i]);
+        let ordered = self.buffers.ordered[i];
 
         /*
         if let Some((Engine::Other(_), fence)) = callback.as_dma_completed() {
@@ -1107,10 +1175,14 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
         }
         */
 
-        self.check_response(i);
+        let response_ok = self.check_response(i);
 
         if let Some(virtio_fence) = self.read_completed_fence(i) {
             data.fence.signal(virtio_fence);
+        }
+
+        if ordered {
+            self.ordered_inflight = false;
         }
 
         match callback {
@@ -1213,6 +1285,16 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
 
             Callback::FreeResourceId(id) => {
                 data.resource_id.free(id.get());
+                self.mark_free(i);
+            },
+
+            Callback::FreeBlobOffset(offset) => {
+                if response_ok {
+                    data.offset_allocator.lock().free(offset);
+                } else {
+                    /* Leaking the BAR reservation is safer than reusing a range the host may still map. */
+                    error!("{}: keeping blob BAR range reserved after failed unmap", function!());
+                }
                 self.mark_free(i);
             },
 
@@ -2248,10 +2330,10 @@ impl GpuChannel {
             resource_id: res_id.get(),
             _padding: 0,
         };
-        let resp: commands::CtrlHeader = self.control.request_blocking(cmd)?;
-        map_virtio_error!(resp.check_type(commands::Command::OK_NODATA)).inspect_err(|_|
-            warn!("{}: failed to attach resource {} to context {}", function!(), res_id.get(), ctx_id.get())
-        )
+        self.control.request_ordered_async::<_, commands::CtrlHeader>(cmd, Callback::None)
+            .inspect_err(|_|
+                warn!("{}: failed to queue attach of resource {} to context {}", function!(), res_id.get(), ctx_id.get())
+            )
     }
 
     pub fn context_detach_resource(&self, ctx_id: NonZero<u32>, res_id: NonZero<u32>) -> Result<(), NtStatus> {
@@ -2260,10 +2342,10 @@ impl GpuChannel {
             resource_id: res_id.get(),
             _padding: 0,
         };
-        let resp: commands::CtrlHeader = self.control.request_blocking(cmd)?;
-        map_virtio_error!(resp.check_type(commands::Command::OK_NODATA)).inspect_err(|_|
-            warn!("{}: failed to detach resource {} from context {}", function!(), res_id.get(), ctx_id.get())
-        )
+        self.control.request_ordered_async::<_, commands::CtrlHeader>(cmd, Callback::None)
+            .inspect_err(|_|
+                warn!("{}: failed to queue detach of resource {} from context {}", function!(), res_id.get(), ctx_id.get())
+            )
     }
 
     pub fn resource_create_blob(&self, ctx_id: NonZero<u32>, res_id: NonZero<u32>, blob_id: u64, mem: BlobMem, flags: BlobFlag, size: u64) -> Result<(), NtStatus> {
@@ -2307,16 +2389,18 @@ impl GpuChannel {
     }
 
     pub fn resource_unmap_blob(&self, id: NonZero<u32>, offset: offset_allocator::Allocation) -> Result<(), NtStatus> {
-        self.data.offset_allocator.lock().free(offset);
-
         let cmd = commands::ResourceUnmapBlob {
             header: self.new_header(commands::Command::RESOURCE_UNMAP_BLOB, true, None, None),
             resource_id: id.get(),
             _padding: 0,
         };
-        self.control.request_blocking::<_, commands::CtrlHeader>(cmd)?;
 
-        Ok(())
+        /*
+         * Keep the BAR range reserved until the host confirms the unmap.
+         * The ordered request also guarantees a following RESOURCE_UNREF
+         * cannot overtake this command.
+         */
+        self.control.request_ordered_async::<_, commands::CtrlHeader>(cmd, Callback::FreeBlobOffset(offset))
     }
 
     // TODO: maybe add a special async callback type for set_cursor / set_scanout + flush
@@ -2357,12 +2441,10 @@ impl GpuChannel {
             _padding: 0,
         };
 
-        let resp: commands::CtrlHeader = self.control.request_blocking(cmd)?;
-        map_virtio_error!(resp.check_type(commands::Command::OK_NODATA)).inspect_err(|_|
-            warn!("{}: failed to detach backing from resource {}", function!(), id.get())
-        )?;
-
-        Ok(())
+        self.control.request_ordered_async::<_, commands::CtrlHeader>(cmd, Callback::None)
+            .inspect_err(|_|
+                warn!("{}: failed to queue backing detach for resource {}", function!(), id.get())
+            )
     }
 
     pub fn resource_unref(&self, id: NonZero<u32>) -> Result<(), NtStatus> {
