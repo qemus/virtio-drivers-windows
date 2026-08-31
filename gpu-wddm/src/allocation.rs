@@ -229,7 +229,7 @@ pub enum VirtioResource {
         mem: BlobMem,
         flags: BlobFlag,
         info: RwLock<Option<BlobInfo>>,
-        map: RwLock<Option<offset_allocator::Allocation>>,
+        map: RwLock<Option<(offset_allocator::Allocation, u64)>>,
         size: u64,
     },
 }
@@ -714,8 +714,8 @@ impl Allocation {
                 None
             },
             VirtioResource::Blob { size, map, ..} => {
-                if let Some(map) = *map.read() {
-                    Some((map.offset as u64 * wdk::wdm::PAGE_SIZE as u64, *size))
+                if let Some((_, bar_offset)) = *map.read() {
+                    Some((bar_offset, *size))
                 } else {
                     None
                 }
@@ -741,7 +741,7 @@ impl Allocation {
                         let (offset_alloc, bar_offset, map_info) = device.context_map_blob(self.id, *size)?;
                         // Fuck borrow checker, this is stupid
                         Self::set_flag_mapped(&self.flags, true);
-                        map.write().replace(offset_alloc);
+                        map.write().replace((offset_alloc, bar_offset));
                         Ok((bar_offset, *size, map_info))
                     }
                 } else {
@@ -760,7 +760,7 @@ impl Allocation {
                     unreachable!();
                 },
                 VirtioResource::Blob {map, ..} => {
-                    map.write().take().unwrap()
+                    map.write().take().unwrap().0
                 },
             };
             device.context_unmap_blob(self.id, offset_alloc)

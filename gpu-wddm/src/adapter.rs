@@ -1218,6 +1218,10 @@ impl Adapter {
         let events_read = map_virtio_error!(read_config!(pci_transport, Config, events_read))?;
         let num_scanouts = map_virtio_error!(read_config!(pci_transport, Config, num_scanouts))? as u8;
         let num_capsets = map_virtio_error!(read_config!(pci_transport, Config, num_capsets))?;
+        // Keep blob allocation/mapping code alignment-aware before
+        // VIRTIO_GPU_F_BLOB_ALIGNMENT is exposed by virtio-drivers.
+        // An alignment of 1 preserves the current unaligned blob semantics.
+        let blob_alignment = 1;
         //info!("events_read: {}, num_scanouts: {}, num_capsets: {}", events_read, num_scanouts, num_capsets);
 
         //info!("negotiated features: {:?}", negotiated_features);
@@ -1244,6 +1248,7 @@ impl Adapter {
                 shmem,
                 num_scanouts,
                 !is_vga,
+                blob_alignment,
             ),
             max_simultaneously_running_commands <- init_array_from_fn(|_| AtomicU32::new(0)),
             system_display_info: None,
@@ -2622,7 +2627,7 @@ impl Adapter {
                    unreachable!()
                },
                VirtioResource::Blob {map, ..} => {
-                   map.read().unwrap()
+                   map.read().unwrap().0
                },
             };
 

@@ -1772,6 +1772,7 @@ struct GpuData {
     num_scanouts: u8,
     has_edid: bool,
     hotplug_enabled: bool,
+    blob_alignment: u64,
     display_ready: AtomicBool,
     display_info: RwLock<[commands::DisplayOne; commands::VIRTIO_GPU_MAX_SCANOUTS]>,
     edids: [RwLock<Option<Box<Edid>>>; commands::VIRTIO_GPU_MAX_SCANOUTS],
@@ -1796,6 +1797,7 @@ impl GpuData {
         num_scanouts: u8,
         has_edid: bool,
         hotplug_enabled: bool,
+        blob_alignment: u64,
     ) -> impl Init<Self, NtStatus> {
         let shmem_pages = (shmem.length / (PAGE_SIZE as u64)) as u32;
 
@@ -1805,6 +1807,7 @@ impl GpuData {
             num_scanouts,
             has_edid,
             hotplug_enabled,
+            blob_alignment,
             display_ready: AtomicBool::new(false),
             display_info: RwLock::new([commands::DisplayOne::default(); commands::VIRTIO_GPU_MAX_SCANOUTS]),
             edids <- init_array_from_fn(|_| RwLock::new(None)),
@@ -2348,7 +2351,16 @@ impl GpuChannel {
             )
     }
 
+    fn aligned_blob_size(&self, size: u64) -> Result<u64, NtStatus> {
+        let alignment = self.data.blob_alignment;
+        debug_assert!(alignment != 0 && alignment.is_power_of_two());
+        size.checked_add(alignment - 1)
+            .map(|value| value & !(alignment - 1))
+            .ok_or(NtStatus(STATUS::INTEGER_OVERFLOW))
+    }
+
     pub fn resource_create_blob(&self, ctx_id: NonZero<u32>, res_id: NonZero<u32>, blob_id: u64, mem: BlobMem, flags: BlobFlag, size: u64) -> Result<(), NtStatus> {
+        let size = self.aligned_blob_size(size)?;
         let cmd = commands::ResourceCreateBlob {
             header: self.new_header(commands::Command::RESOURCE_CREATE_BLOB, true, Some(ctx_id), None),
             resource_id: res_id.get(),
@@ -2368,10 +2380,33 @@ impl GpuChannel {
     }
 
     pub fn resource_map_blob(&self, ctx_id: NonZero<u32>, res_id: NonZero<u32>, size: u64) -> Result<(offset_allocator::Allocation, u64, u32), NtStatus> {
-        let pages = (size / (PAGE_SIZE as u64)) as u32;
+        let size = self.aligned_blob_size(size)?;
+        let page_size = PAGE_SIZE as u64;
+        let pages = size.checked_add(page_size - 1)
+            .map(|value| value / page_size)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(NtStatus(STATUS::INTEGER_OVERFLOW))?;
 
-        let offset = self.data.offset_allocator.lock().allocate(pages).ok_or(STATUS::NO_MEMORY)?;
-        let bar_offset = (offset.offset as u64) * (PAGE_SIZE as u64);
+        /*
+         * The BAR allocator works in pages. When blob_alignment is larger
+         * than PAGE_SIZE, reserve enough leading slack to move the actual
+         * mapping start to the next aligned page while still keeping the
+         * complete blob inside the reserved allocation.
+         */
+        let offset_alignment = self.data.blob_alignment.max(page_size);
+        let alignment_pages = u32::try_from(offset_alignment / page_size)
+            .map_err(|_| NtStatus(STATUS::INTEGER_OVERFLOW))?;
+        let reserve_pages = pages.checked_add(alignment_pages - 1)
+            .ok_or(NtStatus(STATUS::INTEGER_OVERFLOW))?;
+
+        let offset = self.data.offset_allocator.lock().allocate(reserve_pages).ok_or(STATUS::NO_MEMORY)?;
+        let base_page = offset.offset as u64;
+        let alignment_pages = alignment_pages as u64;
+        let aligned_page = (base_page + alignment_pages - 1) & !(alignment_pages - 1);
+        let bar_offset = aligned_page.checked_mul(page_size)
+            .ok_or(NtStatus(STATUS::INTEGER_OVERFLOW))?;
+
+        debug_assert_eq!(bar_offset & (self.data.blob_alignment - 1), 0);
 
         let cmd = commands::ResourceMapBlob {
             header: self.new_header(commands::Command::RESOURCE_MAP_BLOB, true, Some(ctx_id), None),
@@ -2741,6 +2776,7 @@ impl QueueHandler {
         shmem: VirtioCapabilityInfo,
         num_scanouts: u8,
         hotplug_enabled: bool,
+        blob_alignment: u64,
     ) -> impl Init<Self, NtStatus> {
         //trace!("{}: {}", function!(), io_get_remaining_stack_size());
 
@@ -2760,6 +2796,7 @@ impl QueueHandler {
                     num_scanouts,
                     negotiated_features.contains(Features::EDID),
                     hotplug_enabled,
+                    blob_alignment,
                 ))?,
                 chan: GpuChannel {
                     control: control.chan.clone(),
