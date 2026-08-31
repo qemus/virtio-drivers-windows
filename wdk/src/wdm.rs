@@ -182,6 +182,24 @@ impl NtTime {
         Self(Some(v))
     }
 
+    pub fn from_frequency(numerator: u32, denominator: u32) -> Option<Self> {
+        if numerator == 0 || denominator == 0 {
+            return None;
+        }
+
+        let numerator = numerator as u64;
+        let ticks = 10_000_000u64
+            .checked_mul(denominator as u64)?
+            .checked_add(numerator / 2)?
+            / numerator;
+
+        if ticks == 0 || ticks > i32::MAX as u64 {
+            return None;
+        }
+
+        Some(Self(Some(ticks as i64)))
+    }
+
     pub const fn infinite() -> Self {
         Self(None)
     }

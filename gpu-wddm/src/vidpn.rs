@@ -962,25 +962,53 @@ pub const REFRESH_RATE_60HZ: (u32, u32) = (148500000, 2475000);
 pub struct MonitorMode {
     pub width: u32,
     pub height: u32,
-    // TODO
-    //pub refresh_rate: (u32, u32), /* (numerator, denomenator) */
+    pub total_width: u32,
+    pub total_height: u32,
+    pub refresh_rate: (u32, u32),
+    pub h_sync_freq: (u32, u32),
+    pub pixel_rate: u64,
 }
 
 impl MonitorMode {
+    fn legacy_60hz(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            total_width: width,
+            total_height: height,
+            refresh_rate: REFRESH_RATE_60HZ,
+            h_sync_freq: (67500, 1),
+            pixel_rate: 148500000,
+        }
+    }
+
+    fn from_detailed_timing(
+        width: u32,
+        height: u32,
+        total_width: u32,
+        total_height: u32,
+        pixel_rate: u32,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            total_width,
+            total_height,
+            refresh_rate: (pixel_rate, total_width * total_height),
+            h_sync_freq: (pixel_rate, total_width),
+            pixel_rate: pixel_rate as u64,
+        }
+    }
+
     pub fn fill_video_signal_info(&self, info: &mut D3DKMDT_VIDEO_SIGNAL_INFO) {
         info.VideoStandard = D3DKMDT_VIDEO_SIGNAL_STANDARD::D3DKMDT_VSS_OTHER;
-        info.TotalSize.cx = self.width;
-        info.TotalSize.cy = self.height;
-        info.ActiveSize = info.TotalSize;
-        if true {
-            info.VSyncFreq = (148500000, 2475000).into();
-            info.HSyncFreq = (67500, 1).into();
-            info.PixelRate = 148500000;
-        } else {
-            info.VSyncFreq = (!1, !1).into();
-            info.HSyncFreq = (!1, !1).into();
-            info.PixelRate = !1;
-        }
+        info.TotalSize.cx = self.total_width;
+        info.TotalSize.cy = self.total_height;
+        info.ActiveSize.cx = self.width;
+        info.ActiveSize.cy = self.height;
+        info.VSyncFreq = self.refresh_rate.into();
+        info.HSyncFreq = self.h_sync_freq.into();
+        info.PixelRate = self.pixel_rate as _;
         info.__bindgen_anon_1.ScanLineOrdering = D3DDDI_VIDEO_SIGNAL_SCANLINE_ORDERING::D3DDDI_VSSLO_PROGRESSIVE;
     }
 
@@ -1148,8 +1176,18 @@ impl FlipTimer {
         })
     }
 
-    pub fn start(&self) -> Result<(), NtStatus> {
-        Ok(self.timer.start_periodic(NtTime::fps(60))?)
+    pub fn start(&self, refresh_rate: (u32, u32)) -> Result<(), NtStatus> {
+        let period = NtTime::from_frequency(refresh_rate.0, refresh_rate.1)
+            .ok_or(NtStatus(STATUS::INVALID_PARAMETER))?;
+
+        debug!(
+            "{}: vblank frequency {}/{} Hz",
+            function!(),
+            refresh_rate.0,
+            refresh_rate.1,
+        );
+
+        Ok(self.timer.start_periodic(period)?)
     }
 
     pub fn stop(&self) -> Result<(), NtStatus> {
@@ -1427,14 +1465,29 @@ impl VidPnOutput {
             (info.rect.width, info.rect.height)
         };
 
-        let modes = [MonitorMode { width: preferred.0, height: preferred.1 }]
+        let preferred_mode = match edid.preferred_timing() {
+            Ok((width, height, total_width, total_height, pixel_clock_hz))
+                if (width, height) == preferred =>
+            {
+                MonitorMode::from_detailed_timing(
+                    width,
+                    height,
+                    total_width,
+                    total_height,
+                    pixel_clock_hz,
+                )
+            }
+            _ => MonitorMode::legacy_60hz(preferred.0, preferred.1),
+        };
+
+        let modes = [preferred_mode]
             .into_iter()
             .chain(edid
                 .standard_timings()
                 .iter()
                 .filter_map(|resolution|
                     if *resolution != preferred {
-                        Some(MonitorMode { width: resolution.0, height: resolution.1 })
+                        Some(MonitorMode::legacy_60hz(resolution.0, resolution.1))
                     } else {
                         None
                     }

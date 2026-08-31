@@ -1019,6 +1019,38 @@ impl Adapter {
         Box::try_init(Self::init(device)).map_err(|e| NtStatus(STATUS::NO_MEMORY))
     }
 
+    fn active_refresh_rate(state: &AdapterState) -> (u32, u32) {
+        let mut selected: Option<(u32, u32)> = None;
+
+        for output in state.outputs.iter().flatten() {
+            let Some(current_mode) = output.current_mode else {
+                continue;
+            };
+            let Some(mode) = output.modes.get(current_mode) else {
+                return REFRESH_RATE_60HZ;
+            };
+
+            let candidate = mode.refresh_rate;
+            if candidate.0 == 0 || candidate.1 == 0 {
+                return REFRESH_RATE_60HZ;
+            }
+
+            if let Some(current) = selected {
+                let lhs = current.0 as u64 * candidate.1 as u64;
+                let rhs = candidate.0 as u64 * current.1 as u64;
+                if lhs != rhs {
+                    // There is one global vblank timer for all scanouts. Keep the
+                    // old 60 Hz behaviour when active outputs require different rates.
+                    return REFRESH_RATE_60HZ;
+                }
+            } else {
+                selected = Some(candidate);
+            }
+        }
+
+        selected.unwrap_or(REFRESH_RATE_60HZ)
+    }
+
     fn get_pci_bus_info(&self) -> Result<DeviceFunction, NtStatus> {
         trace!("{}", function!());
         let mut len: u32 = 0;
@@ -1264,7 +1296,8 @@ impl Adapter {
             error!("{}: failed to create flip timer: {:?}", function!(), e)
         )?;
 
-        flip_timer.start().inspect_err(|e|
+        let refresh_rate = Self::active_refresh_rate(state);
+        flip_timer.start(refresh_rate).inspect_err(|e|
             error!("{}: failed to start flip timer: {:?}", function!(), e)
         )?;
 
@@ -2890,6 +2923,11 @@ impl Adapter {
         }
 
         state.source_target_map[commit.AffectedVidPnSourceId as usize] = targets;
+
+        let refresh_rate = Self::active_refresh_rate(state);
+        if let Some(flip_timer) = self.flip_timer.as_ref() {
+            flip_timer.start(refresh_rate)?;
+        }
 
         Ok(())
     }
