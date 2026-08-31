@@ -412,14 +412,23 @@ unsafe extern "C" fn query_child_status(adapter: HANDLE, child_status: *mut DXGK
         Err(e) => return e.0.to_u32(),
     };
 
-    assert!(child_status.ChildUid < num_scanouts);
+    if child_status.ChildUid >= num_scanouts {
+        error!("{}: invalid child uid {} (max {})", function!(), child_status.ChildUid, num_scanouts);
+        return STATUS::INVALID_PARAMETER.to_u32();
+    }
 
     match child_status.Type {
         DXGK_CHILD_STATUS_TYPE::StatusConnection => {
-            child_status.__bindgen_anon_1.HotPlug.Connected = gpu.queue_handler().is_some() as _;
+            match gpu.is_child_connected(child_status.ChildUid as usize) {
+                Ok(connected) => {
+                    child_status.__bindgen_anon_1.HotPlug.Connected = connected as _;
+                },
+                Err(e) => return e.to_u32(),
+            }
         },
         _ => {
             error!("{}: invalid child status query: {:?}", function!(), child_status.Type);
+            return STATUS::NOT_SUPPORTED.to_u32();
         }
     }
 

@@ -1078,8 +1078,38 @@ impl MonitorMode {
     }
 }
 
+pub struct AtomicRect {
+    position: AtomicU64,
+    size: AtomicU64,
+}
+
+impl AtomicRect {
+    pub fn new(rect: commands::Rect) -> Self {
+        Self {
+            position: AtomicU64::new((rect.x as u64) | ((rect.y as u64) << 32)),
+            size: AtomicU64::new((rect.width as u64) | ((rect.height as u64) << 32)),
+        }
+    }
+
+    pub fn load(&self) -> commands::Rect {
+        let size = self.size.load(Ordering::Acquire);
+        let position = self.position.load(Ordering::Acquire);
+        commands::Rect {
+            x: position as u32,
+            y: (position >> 32) as u32,
+            width: size as u32,
+            height: (size >> 32) as u32,
+        }
+    }
+
+    pub fn store(&self, rect: commands::Rect) {
+        self.size.store((rect.width as u64) | ((rect.height as u64) << 32), Ordering::Release);
+        self.position.store((rect.x as u64) | ((rect.y as u64) << 32), Ordering::Release);
+    }
+}
+
 pub struct FlipTimerContext {
-    pub rects: [commands::Rect; 16],
+    pub rects: [AtomicRect; 16],
     pub addrs: [AtomicU64; 16],
     //pub addrs: [(AtomicU64, AtomicPtr<Allocation>); 16],
     pub flipq: [Option<Arc<ArrayQueue<(Weak<Allocation>, u64)>>>; 16],
@@ -1128,7 +1158,7 @@ impl FlipTimerContext {
                     };
 
                     //let _ = wdk::wdm::ke_delay_execution_thread(wdk::wdm::NtTime::relative_ms(10));
-                    let _ = self.chan.resource_flush(res_id, self.rects[i]).inspect_err(|e|
+                    let _ = self.chan.resource_flush(res_id, self.rects[i].load()).inspect_err(|e|
                         error!("{}: failed to flush resource: {:?}", function!(), e)
                     );
                 }
@@ -1165,9 +1195,11 @@ impl FlipTimerContext {
 
             //let _ = wdk::wdm::ke_delay_execution_thread(wdk::wdm::NtTime::relative_ms(10));
 
+            let rect = self.rects[i].load();
+
             match alloc.resource() {
                 VirtioResource::_3D { .. } => {
-                    let _ = self.chan.set_scanout(self.rects[i], i as u32, res_id).inspect_err(|e|
+                    let _ = self.chan.set_scanout(rect, i as u32, res_id).inspect_err(|e|
                         error!("{}: failed to set scanout: {:?}", function!(), e)
                     );
                 },
@@ -1177,13 +1209,13 @@ impl FlipTimerContext {
                         continue;
                     };
 
-                    let _ = self.chan.set_scanout_blob(self.rects[i], i as u32, res_id, info).inspect_err(|e|
+                    let _ = self.chan.set_scanout_blob(rect, i as u32, res_id, info).inspect_err(|e|
                         error!("{}: failed to set scanout: {:?}", function!(), e)
                     );
                 },
             }
 
-            let _ = self.chan.resource_flush(res_id, self.rects[i]).inspect_err(|e|
+            let _ = self.chan.resource_flush(res_id, rect).inspect_err(|e|
                 error!("{}: failed to flush resource: {:?}", function!(), e)
             );
 
@@ -1260,6 +1292,12 @@ impl FlipTimer {
         self.inner.last_vblank_timestamp.store(timestamp, Ordering::Release);
 
         Ok(self.timer.start_periodic(period)?)
+    }
+
+    pub fn set_rect(&self, scanout: usize, rect: commands::Rect) {
+        if let Some(slot) = self.inner.rects.get(scanout) {
+            slot.store(rect);
+        }
     }
 
     pub fn raster_status(&self, mode: &MonitorMode) -> Option<(bool, u32)> {
@@ -1547,7 +1585,7 @@ pub struct VidPnOutput {
 }
 
 impl VidPnOutput {
-    pub fn new(info: commands::DisplayOne, edid: Box<Edid>) -> Self {
+    fn build_modes(info: commands::DisplayOne, edid: &Edid) -> Vec<MonitorMode> {
         let preferred = if info.rect.width < 640 || info.rect.height < 480 {
             edid.preferred_resolution().unwrap()
         } else {
@@ -1569,7 +1607,7 @@ impl VidPnOutput {
             _ => MonitorMode::legacy_60hz(preferred.0, preferred.1),
         };
 
-        let modes = [preferred_mode]
+        [preferred_mode]
             .into_iter()
             .chain(edid
                 .standard_timings()
@@ -1582,16 +1620,13 @@ impl VidPnOutput {
                     }
                 )
             )
-            .collect();
+            .collect()
+    }
 
+    pub fn new(info: commands::DisplayOne, edid: Box<Edid>) -> Self {
+        let modes = Self::build_modes(info, &edid);
         let flipq = Arc::new(ArrayQueue::new(128));
-
-        let current_mode = if info.enabled == 0 {
-            None
-        } else {
-            Some(0)
-        };
-
+        let current_mode = if info.enabled == 0 { None } else { Some(0) };
         let cursor = SpinMutex::new(None);
 
         Self {
@@ -1602,6 +1637,26 @@ impl VidPnOutput {
             flipq,
             cursor,
         }
+    }
+
+    pub fn update_display(&mut self, info: commands::DisplayOne, edid: Option<Box<Edid>>) {
+        let old_resolution = self.current_mode
+            .and_then(|index| self.modes.get(index))
+            .map(|mode| (mode.width, mode.height));
+
+        if let Some(edid) = edid {
+            self.edid = edid;
+        }
+
+        self.rect = info.rect;
+        self.modes = Self::build_modes(info, &self.edid);
+        self.current_mode = if info.enabled == 0 {
+            None
+        } else if let Some((width, height)) = old_resolution {
+            self.modes.iter().position(|mode| mode.width == width && mode.height == height).or(Some(0))
+        } else {
+            Some(0)
+        };
     }
 
     pub fn hide_cursor(&self, scanout: u32, chan: &GpuChannel, empty: &Cursor) -> Result<(), NtStatus> {

@@ -426,6 +426,16 @@ impl DxgkInterface {
         Ok(())
     }
 
+    pub fn indicate_child_status(&self, child_uid: u32, connected: bool) -> Result<(), NtStatus> {
+        let mut status: DXGK_CHILD_STATUS = unsafe { zeroed() };
+        status.Type = DXGK_CHILD_STATUS_TYPE::StatusConnection;
+        status.ChildUid = child_uid;
+        status.__bindgen_anon_1.HotPlug.Connected = connected as _;
+
+        dxgk_call_status!(<= DISPATCH_LEVEL | self.DxgkCbIndicateChildStatus(&mut status as _))?;
+        Ok(())
+    }
+
     fn queue_dpc(&self) -> bool {
         dxgk_call!(<= PROFILE_LEVEL | self.DxgkCbQueueDpc()) != 0
     }
@@ -1227,7 +1237,14 @@ impl Adapter {
             negotiated_features,
             supported_capsets: CapsetMask::default(),
             capset_info <- init_array_from_fn(|_| (CapsetInfo::default(), RwLock::new(None))),
-            queue_handler <- QueueHandler::new(pci_transport, pci_root.configuration_access, *negotiated_features, shmem),
+            queue_handler <- QueueHandler::new(
+                pci_transport,
+                pci_root.configuration_access,
+                *negotiated_features,
+                shmem,
+                num_scanouts,
+                !is_vga,
+            ),
             max_simultaneously_running_commands <- init_array_from_fn(|_| AtomicU32::new(0)),
             system_display_info: None,
             empty_cursor: None,
@@ -1245,8 +1262,9 @@ impl Adapter {
         state.capset_info = capset_info.map(|i| (i, RwLock::new(None)));
 
         let display_modes = chan.get_display_info()?;
+        chan.cache_display_info(display_modes);
 
-        let mut rects = [commands::Rect { width: 0, height: 0, x: 0, y: 0}; 16];
+        let mut rect_values = [commands::Rect { width: 0, height: 0, x: 0, y: 0}; 16];
         let mut flipq = [const { None }; 16];
         let addrs = [const { AtomicU64::new(0) }; 16];
         let vsync_enabled = AtomicBool::new(false);
@@ -1258,6 +1276,7 @@ impl Adapter {
         for scanout in 0..(num_scanouts as usize) {
             let edid = chan.get_edid(scanout as _)?;
             let _ = map_virtio_error!(edid.preferred_resolution())?;
+            chan.cache_edid(scanout, &edid)?;
 
             let info = VidPnOutput::new(display_modes[scanout], edid);
 
@@ -1265,10 +1284,12 @@ impl Adapter {
             for (i, mode) in info.modes.iter().enumerate() {
                 debug!("mode {}: {:?}", i, mode);
             }
-            rects[scanout] = info.rect;
+            rect_values[scanout] = info.rect;
             flipq[scanout] = Some(info.flipq.clone());
             state.outputs[scanout] = Some(info);
         }
+
+        let rects = rect_values.map(AtomicRect::new);
 
         state.empty_cursor = Some(Cursor::try_new(&chan, 64, 64, 0, 0, 0, 0)?);
 
@@ -1311,6 +1332,12 @@ impl Adapter {
 
         if is_vga {
             state.system_display_info = Some(state.queue_handler.dxgk_interface().acquire_post_display_ownership()?);
+        }
+
+        chan.set_display_ready();
+        if events_read & (1 << 0) != 0 {
+            /* Process a display event that was already pending when StartDevice began. */
+            state.queue_handler.kick();
         }
 
         //Err(NtStatus(STATUS::UNSUCCESSFUL))
@@ -2584,6 +2611,54 @@ impl Adapter {
         Ok(())
     }
 
+    pub fn is_child_connected(&self, scanout: usize) -> Result<bool, NtStatus> {
+        let state = check_state!(self)?;
+        if scanout >= state.num_scanouts as usize {
+            return Err(NtStatus(STATUS::INVALID_PARAMETER));
+        }
+
+        if state.is_vga {
+            return Ok(true);
+        }
+
+        state.queue_handler.display_connected(scanout)
+            .ok_or(NtStatus(STATUS::INVALID_DEVICE_STATE))
+    }
+
+    fn refresh_output_from_cache(&mut self, scanout: usize) -> Result<(), NtStatus> {
+        let rect = {
+            let state = check_state_mut!(self)?;
+            if scanout >= state.num_scanouts as usize {
+                return Err(NtStatus(STATUS::INVALID_PARAMETER));
+            }
+
+            let Some(info) = state.queue_handler.display_info(scanout) else {
+                return Ok(());
+            };
+            let edid = state.queue_handler.cached_edid(scanout)?;
+            let output = state.outputs[scanout]
+                .as_mut()
+                .ok_or(NtStatus(STATUS::GRAPHICS_INVALID_VIDEO_PRESENT_TARGET))?;
+
+            output.update_display(info, edid);
+            output.rect
+        };
+
+        if let Some(timer) = self.flip_timer.as_ref() {
+            timer.set_rect(scanout, rect);
+        }
+
+        Ok(())
+    }
+
+    fn refresh_all_outputs_from_cache(&mut self) -> Result<(), NtStatus> {
+        let num_scanouts = self.num_scanouts()? as usize;
+        for scanout in 0..num_scanouts {
+            self.refresh_output_from_cache(scanout)?;
+        }
+        Ok(())
+    }
+
     pub fn num_scanouts(&self) -> Result<u8, NtStatus> {
         trace!("{}", function!());
 
@@ -2661,13 +2736,18 @@ impl Adapter {
         Ok(())
     }
 
-    pub fn get_edid(&self, scanout: usize) -> Result<&[u8], NtStatus> {
+    pub fn get_edid(&self, scanout: usize) -> Result<Box<[u8]>, NtStatus> {
         trace!("{}", function!());
 
         let state = check_state!(self)?;
         if scanout >= state.num_scanouts as usize {
             error!("{}: invalid scanout {}: out of range (max {})", function!(), scanout, state.num_scanouts);
             return Err(NtStatus(STATUS::INVALID_PARAMETER));
+        }
+
+        if let Some(edid) = state.queue_handler.cached_edid(scanout)? {
+            let len = core::cmp::min(256, edid.size as usize);
+            return Ok(Box::try_from(&edid.data[..len])?);
         }
 
         let edid = match &state.outputs[scanout] {
@@ -2678,13 +2758,14 @@ impl Adapter {
             }
         };
 
-        Ok(edid)
+        Ok(Box::try_from(edid)?)
     }
 
-    pub fn recommend_monitor_modes(&self, recommend_monitor_modes: &DXGKARG_RECOMMENDMONITORMODES) -> Result<(), NtStatus> {
+    pub fn recommend_monitor_modes(&mut self, recommend_monitor_modes: &DXGKARG_RECOMMENDMONITORMODES) -> Result<(), NtStatus> {
         trace!("{}", function!());
 
         let scanout = recommend_monitor_modes.VideoPresentTargetId as usize;
+        self.refresh_output_from_cache(scanout)?;
         let state = check_state!(self)?;
         if scanout >= state.num_scanouts as usize {
             error!("{}: invalid scanout {}: out of range (max {})", function!(), scanout, state.num_scanouts);
@@ -2873,6 +2954,7 @@ impl Adapter {
     // This can be mut as per the WDDM threading and synchronization model
     pub fn commit_vidpn(&mut self, commit: &DXGKARG_COMMITVIDPN) -> Result<(), NtStatus> {
         trace!("{}", function!());
+        self.refresh_all_outputs_from_cache()?;
         let state = check_state_mut!(self)?;
         if commit.AffectedVidPnSourceId >= state.num_scanouts as _ {
             error!("{}: invalid scanout {}: out of range (max {})", function!(), commit.AffectedVidPnSourceId, state.num_scanouts);
@@ -2965,8 +3047,9 @@ impl Adapter {
         Ok(())
     }
 
-    pub fn enum_cofunc_modality(&self, enum_cofunc_modality: &DXGKARG_ENUMVIDPNCOFUNCMODALITY) -> Result<(), NtStatus> {
+    pub fn enum_cofunc_modality(&mut self, enum_cofunc_modality: &DXGKARG_ENUMVIDPNCOFUNCMODALITY) -> Result<(), NtStatus> {
         trace!("{}", function!());
+        self.refresh_all_outputs_from_cache()?;
         let state = check_state!(self)?;
 
         let vidpn = state.queue_handler.dxgk_interface().query_vidpn_interface(enum_cofunc_modality.hConstrainingVidPn).inspect_err(|e|

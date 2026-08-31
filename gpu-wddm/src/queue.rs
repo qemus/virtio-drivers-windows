@@ -240,6 +240,8 @@ impl Drop for AllocationsBatch {
 enum Callback<const MAX_INLINE: usize> {
     None,
     SetEvent(BlockingBuffer<MaybeInlineBuffer<MAX_INLINE>>),
+    DisplayInfo,
+    DisplayEdid(u32, bool),
     //SetEvent(NonNull<KeEvent>, Option<NonNull<MaybeUninit<MaybeInlineBuffer<MAX_INLINE>>>>, CancellationSignal),
     FreeContextId(NonZero<u32>),
     FreeResourceId(NonZero<u32>),
@@ -1045,6 +1047,89 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
                 block.set();
             },
 
+            Callback::DisplayInfo => {
+                let output = self.buffers.outputs[i].as_ref().unwrap().as_ref();
+                let parsed = commands::RespDisplayInfo::ref_from_prefix(output);
+
+                match parsed {
+                    Ok((resp, _)) if resp.header.check_type(commands::Command::OK_DISPLAY_INFO).is_ok() => {
+                        let changed = data.cache_display_info(resp.pmodes);
+
+                        for scanout in 0..data.num_scanouts as usize {
+                            let connected = resp.pmodes[scanout].enabled != 0;
+
+                            if data.has_edid && connected {
+                                let cmd = commands::GetEdid {
+                                    header: commands::CtrlHeader::with_type(commands::Command::GET_EDID),
+                                    scanout: scanout as u32,
+                                    _padding: 0,
+                                };
+
+                                if let Err(e) = self.chan.request_async::<_, commands::RespGetEdid>(
+                                    cmd,
+                                    Callback::DisplayEdid(scanout as u32, changed[scanout]),
+                                ) {
+                                    error!("{}: failed to queue EDID refresh for scanout {}: {:?}", function!(), scanout, e);
+                                    if changed[scanout] {
+                                        data.notify_child_connection(scanout);
+                                    }
+                                }
+                            } else if changed[scanout] {
+                                /* No EDID is needed for a disconnected output. */
+                                data.notify_child_connection(scanout);
+                            }
+                        }
+                    },
+                    Ok((resp, _)) => {
+                        error!("{}: invalid display info response: {:?}", function!(), resp.header);
+                    },
+                    Err(e) => {
+                        error!("{}: failed to parse display info response: {:?}", function!(), e);
+                    },
+                }
+
+                self.mark_free(i);
+            },
+
+            Callback::DisplayEdid(scanout, display_changed) => {
+                let output = self.buffers.outputs[i].as_ref().unwrap().as_ref();
+                let mut notify = display_changed;
+
+                match commands::RespGetEdid::ref_from_prefix(output) {
+                    Ok((resp, _)) if resp.header.check_type(commands::Command::OK_EDID).is_ok() => {
+                        let edid = Box::try_new(Edid {
+                            data: resp.edid,
+                            size: resp.size,
+                        });
+
+                        match edid {
+                            Ok(edid) => {
+                                /* Do not replace a known-good descriptor with malformed data. */
+                                if edid.preferred_resolution().is_ok() {
+                                    notify |= data.cache_edid(scanout as usize, edid);
+                                } else {
+                                    error!("{}: invalid EDID for scanout {}", function!(), scanout);
+                                }
+                            },
+                            Err(e) => {
+                                error!("{}: failed to allocate EDID for scanout {}: {:?}", function!(), scanout, e);
+                            },
+                        }
+                    },
+                    Ok((resp, _)) => {
+                        error!("{}: invalid EDID response for scanout {}: {:?}", function!(), scanout, resp.header);
+                    },
+                    Err(e) => {
+                        error!("{}: failed to parse EDID response for scanout {}: {:?}", function!(), scanout, e);
+                    },
+                }
+
+                if notify {
+                    data.notify_child_connection(scanout as usize);
+                }
+                self.mark_free(i);
+            },
+
             Callback::FreeResourceId(id) => {
                 data.resource_id.free(id.get());
                 self.mark_free(i);
@@ -1507,6 +1592,13 @@ struct GpuData {
     pub interface: DxgkInterface,
     pub shmem: VirtioCapabilityInfo,
 
+    num_scanouts: u8,
+    has_edid: bool,
+    hotplug_enabled: bool,
+    display_ready: AtomicBool,
+    display_info: RwLock<[commands::DisplayOne; commands::VIRTIO_GPU_MAX_SCANOUTS]>,
+    edids: [RwLock<Option<Box<Edid>>>; commands::VIRTIO_GPU_MAX_SCANOUTS],
+
     resource_id: SimpleIdAllocator,
     context_id: SimpleIdAllocator,
     offset_allocator: SpinMutex<offset_allocator::Allocator>,
@@ -1520,12 +1612,24 @@ struct GpuData {
 }
 
 impl GpuData {
-    fn new(interface: DxgkInterface, shmem: VirtioCapabilityInfo) -> impl Init<Self, NtStatus> {
+    fn new(
+        interface: DxgkInterface,
+        shmem: VirtioCapabilityInfo,
+        num_scanouts: u8,
+        has_edid: bool,
+        hotplug_enabled: bool,
+    ) -> impl Init<Self, NtStatus> {
         let shmem_pages = (shmem.length / (PAGE_SIZE as u64)) as u32;
 
         init!(Self {
             interface,
             shmem,
+            num_scanouts,
+            has_edid,
+            hotplug_enabled,
+            display_ready: AtomicBool::new(false),
+            display_info: RwLock::new([commands::DisplayOne::default(); commands::VIRTIO_GPU_MAX_SCANOUTS]),
+            edids <- init_array_from_fn(|_| RwLock::new(None)),
             resource_id: SimpleIdAllocator::new(1),
             context_id: SimpleIdAllocator::new(1),
             offset_allocator: SpinMutex::new(offset_allocator::Allocator::with_max_allocs(shmem_pages, 1024 * 1024)),
@@ -1542,6 +1646,88 @@ impl GpuData {
             }),
             fence_submissions: SpinMutex::new(SmallVec::new()),
         }? NtStatus)
+    }
+
+    fn display_equal(a: &commands::DisplayOne, b: &commands::DisplayOne) -> bool {
+        a.enabled == b.enabled
+            && a.flags == b.flags
+            && a.rect.x == b.rect.x
+            && a.rect.y == b.rect.y
+            && a.rect.width == b.rect.width
+            && a.rect.height == b.rect.height
+    }
+
+    fn cache_display_info(
+        &self,
+        display_info: [commands::DisplayOne; commands::VIRTIO_GPU_MAX_SCANOUTS],
+    ) -> [bool; commands::VIRTIO_GPU_MAX_SCANOUTS] {
+        let mut cached = self.display_info.write();
+        let mut changed = [false; commands::VIRTIO_GPU_MAX_SCANOUTS];
+
+        for scanout in 0..self.num_scanouts as usize {
+            changed[scanout] = !Self::display_equal(&cached[scanout], &display_info[scanout]);
+        }
+
+        *cached = display_info;
+        changed
+    }
+
+    fn display_info(&self, scanout: usize) -> Option<commands::DisplayOne> {
+        if scanout >= self.num_scanouts as usize {
+            return None;
+        }
+        Some(self.display_info.read()[scanout])
+    }
+
+    fn display_connected(&self, scanout: usize) -> Option<bool> {
+        self.display_info(scanout).map(|info| info.enabled != 0)
+    }
+
+    fn cache_edid(&self, scanout: usize, edid: Box<Edid>) -> bool {
+        if scanout >= self.num_scanouts as usize {
+            return false;
+        }
+
+        let mut cached = self.edids[scanout].write();
+        let changed = cached.as_ref().map_or(true, |old|
+            old.size != edid.size || old.data != edid.data
+        );
+        *cached = Some(edid);
+        changed
+    }
+
+    fn cached_edid(&self, scanout: usize) -> Result<Option<Box<Edid>>, NtStatus> {
+        if scanout >= self.num_scanouts as usize {
+            return Ok(None);
+        }
+
+        let (data, size) = {
+            let cached = self.edids[scanout].read();
+            let Some(edid) = cached.as_ref() else {
+                return Ok(None);
+            };
+            (edid.data, edid.size)
+        };
+
+        Ok(Some(Box::try_new(Edid { data, size })?))
+    }
+
+    fn set_display_ready(&self) {
+        self.display_ready.store(true, Ordering::Release);
+    }
+
+    fn notify_child_connection(&self, scanout: usize) {
+        if !self.hotplug_enabled || !self.display_ready.load(Ordering::Acquire) {
+            return;
+        }
+
+        let Some(connected) = self.display_connected(scanout) else {
+            return;
+        };
+
+        if let Err(e) = self.interface.indicate_child_status(scanout as u32, connected) {
+            error!("{}: failed to indicate child {} status: {:?}", function!(), scanout, e);
+        }
     }
 
     fn notify_fence(&self, engine: Engine, fence: u32, notify_cb: &dyn Fn(Engine, u32)) {
@@ -1682,6 +1868,38 @@ impl GpuChannel {
 
     fn next_context_id(&self) -> Option<NonZero<u32>> {
         self.data.context_id.next().map(NonZero::new).flatten()
+    }
+
+    pub fn cache_display_info(
+        &self,
+        display_info: [commands::DisplayOne; commands::VIRTIO_GPU_MAX_SCANOUTS],
+    ) {
+        self.data.cache_display_info(display_info);
+    }
+
+    pub fn cache_edid(&self, scanout: usize, edid: &Edid) -> Result<(), NtStatus> {
+        let copy = Box::try_new(Edid {
+            data: edid.data,
+            size: edid.size,
+        })?;
+        self.data.cache_edid(scanout, copy);
+        Ok(())
+    }
+
+    pub fn set_display_ready(&self) {
+        self.data.set_display_ready();
+    }
+
+    pub fn display_info(&self, scanout: usize) -> Option<commands::DisplayOne> {
+        self.data.display_info(scanout)
+    }
+
+    pub fn display_connected(&self, scanout: usize) -> Option<bool> {
+        self.data.display_connected(scanout)
+    }
+
+    pub fn cached_edid(&self, scanout: usize) -> Result<Option<Box<Edid>>, NtStatus> {
+        self.data.cached_edid(scanout)
     }
 
     pub fn dxgk_interface(&self) -> &DxgkInterface {
@@ -2303,7 +2521,14 @@ const _: () = assert!(size_of::<QueueHandler>() <= 21504*2);
 unsafe impl Send for QueueHandler {}
 
 impl QueueHandler {
-    pub fn new(mut pci_transport: PciTransport, interface: DxgkInterface, negotiated_features: Features, shmem: VirtioCapabilityInfo) -> impl Init<Self, NtStatus> {
+    pub fn new(
+        mut pci_transport: PciTransport,
+        interface: DxgkInterface,
+        negotiated_features: Features,
+        shmem: VirtioCapabilityInfo,
+        num_scanouts: u8,
+        hotplug_enabled: bool,
+    ) -> impl Init<Self, NtStatus> {
         //trace!("{}: {}", function!(), io_get_remaining_stack_size());
 
         let access_platform = negotiated_features.contains(Features::ACCESS_PLATFORM);
@@ -2316,7 +2541,13 @@ impl QueueHandler {
                 cursor <- CursorQueue::new(&mut pci_transport, access_platform, indirect, event_idx),
                 pci_transport: pci_transport,
                 thread: Box::try_pin_init(Thread::new())?,
-                data: Arc::try_init(GpuData::new(interface, shmem))?,
+                data: Arc::try_init(GpuData::new(
+                    interface,
+                    shmem,
+                    num_scanouts,
+                    negotiated_features.contains(Features::EDID),
+                    hotplug_enabled,
+                ))?,
                 chan: GpuChannel {
                     control: control.chan.clone(),
                     cursor: cursor.chan.clone(),
@@ -2332,6 +2563,18 @@ impl QueueHandler {
             cursor: self.cursor.chan.clone(),
             data: self.data.clone(),
         }
+    }
+
+    pub fn display_info(&self, scanout: usize) -> Option<commands::DisplayOne> {
+        self.data.display_info(scanout)
+    }
+
+    pub fn display_connected(&self, scanout: usize) -> Option<bool> {
+        self.data.display_connected(scanout)
+    }
+
+    pub fn cached_edid(&self, scanout: usize) -> Result<Option<Box<Edid>>, NtStatus> {
+        self.data.cached_edid(scanout)
     }
 
     pub fn get_shmem_slice(&self) -> (u64, u64) {
@@ -2354,6 +2597,27 @@ impl QueueHandler {
 
     pub fn last_submitted_fence(&self, engine: Engine) -> u32 {
         self.data.engines[engine.node_ordinal() as usize].last_submitted_fence.load(Ordering::SeqCst)
+    }
+
+    fn handle_config_change(&mut self) -> Result<(), NtStatus> {
+        const VIRTIO_GPU_EVENT_DISPLAY: u32 = 1 << 0;
+
+        let events = map_virtio_error!(read_config!(self.pci_transport, Config, events_read))?;
+        if events & VIRTIO_GPU_EVENT_DISPLAY == 0 {
+            return Ok(());
+        }
+
+        /* Clear before queueing the refresh so a later change generates a new event. */
+        map_virtio_error!(write_config!(
+            self.pci_transport,
+            Config,
+            events_clear,
+            VIRTIO_GPU_EVENT_DISPLAY,
+        ))?;
+
+        let cmd = commands::CtrlHeader::with_type(commands::Command::GET_DISPLAY_INFO);
+        self.chan.control.request_async::<_, commands::RespDisplayInfo>(cmd, Callback::DisplayInfo)?;
+        Ok(())
     }
 
     fn handler_thread_routine(&mut self) {
@@ -2400,8 +2664,9 @@ impl QueueHandler {
                     self.cursor.handle_responses(&chan.data);
                 },
                 events.config_irq => {
-                    // TODO
-                    //info!("- new config change");
+                    if let Err(e) = self.handle_config_change() {
+                        error!("{}: failed to handle config change: {:?}", function!(), e);
+                    }
                 },
                 events.stop => {
                     info!("- stopping thread");
@@ -2446,7 +2711,7 @@ impl QueueHandler {
     }
 
     pub fn handle_dpc(&self) {
-        let irq = InterruptStatus::from_bits_truncate(self.data.irq.load(Ordering::SeqCst));
+        let irq = InterruptStatus::from_bits_truncate(self.data.irq.swap(0, Ordering::SeqCst));
 
         if irq.contains(InterruptStatus::QUEUE_INTERRUPT) {
             self.thread.events().control_irq.set();
