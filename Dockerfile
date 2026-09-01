@@ -292,8 +292,21 @@ RUN set -eux; \
 WORKDIR /src/d3d11
 RUN set -eux; \
     vulkan_import="$(find /usr/lib -type f -path '*/wine/x86_64-windows/libvulkan-1.a' -print -quit)"; \
-    test -n "${vulkan_import}"; \
-    export LIBRARY_PATH="$(dirname "${vulkan_import}")"; \
+    test -s "${vulkan_import}"; \
+    test -d /usr/x86_64-w64-mingw32/lib; \
+    install -m0644 "${vulkan_import}" /usr/x86_64-w64-mingw32/lib/libvulkan-1.dll.a; \
+    printf '%s\n' \
+      '__declspec(dllimport) void *vkGetInstanceProcAddr(void *, const char *);' \
+      'int main(void) { return vkGetInstanceProcAddr(0, 0) != 0; }' \
+      > /tmp/vulkan-link-probe.c; \
+    x86_64-w64-mingw32-gcc \
+      /tmp/vulkan-link-probe.c \
+      -o /tmp/vulkan-link-probe.exe \
+      -lvulkan-1; \
+    file /tmp/vulkan-link-probe.exe | grep -q 'PE32+'; \
+    x86_64-w64-mingw32-objdump -p /tmp/vulkan-link-probe.exe \
+      | grep -Eiq 'DLL Name: .*vulkan-1\.dll'; \
+    rm -f /tmp/vulkan-link-probe.c /tmp/vulkan-link-probe.exe; \
     make -j"$(nproc)" DXVK_GIT_VERSION="${DXVK_SHA}"; \
     test -f build/dist/dx11um_virtio.dll; \
     test -f build/dist/dx11um_virtio.debug; \
