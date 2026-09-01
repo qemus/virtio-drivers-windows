@@ -91,7 +91,7 @@ jobs:
 
           df -h /
 
-      - name: Resolve floating qemus master commits
+      - name: Resolve master commits
         id: refs
         shell: bash
         run: |
