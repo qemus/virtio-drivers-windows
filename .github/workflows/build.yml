@@ -56,11 +56,22 @@ jobs:
           [[ "${{ vars.MAJOR }}" =~ ^[0-9]+$ ]]
           [[ "${{ vars.MINOR }}" =~ ^[0-9]+$ ]]
 
-          # Microsoft requires every DriverVer component to be < 65535.
-          (( 10#${{ vars.MAJOR }} < 65535 ))
-          (( 10#${{ vars.MINOR }} < 65535 ))
+          # Windows DriverVer is w.x.y.z: four numeric components,
+          # each strictly less than 65535. Our release scheme is
+          # MAJOR.MINOR.0.0.
+          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.0\.0$ ]]
 
-          [[ "${VERSION}" =~ ^1\.[0-9]+\.[0-9]+\.0$ ]]
+          IFS='.' read -r v1 v2 v3 v4 <<< "${VERSION}"
+          for component in "${v1}" "${v2}" "${v3}" "${v4}"; do
+            [[ "${component}" =~ ^[0-9]+$ ]]
+            (( 10#${component} < 65535 ))
+          done
+
+          test "${v1}" = "${{ vars.MAJOR }}"
+          test "${v2}" = "${{ vars.MINOR }}"
+          test "${v3}" = "0"
+          test "${v4}" = "0"
+
           echo "Building driver/release version ${VERSION}"
 
       - name: Free runner disk space
