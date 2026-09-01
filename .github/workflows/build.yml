@@ -1,0 +1,296 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Windows DriverVer requires four numeric components, so the required fourth
+  # component is fixed at zero. This exact value is used everywhere.
+  VERSION: 1.${{ vars.MAJOR }}.${{ vars.MINOR }}.0
+
+  # Only these two repositories float. Each run resolves master once and then
+  # passes the exact SHA to BuildKit as a named Git context.
+  D3D11_REPO: https://github.com/qemus/virtio-d3d11.git
+  KMD_REPO: https://github.com/qemus/virtio-drivers-windows.git
+
+  # Everything below is pinned.
+  MESA_ARCHIVE_URL: https://gitlab.freedesktop.org/anonymix007/mesa/-/archive/venus-win32/mesa-venus-win32.tar.gz
+  MESA_TREE_SHA256: 9f216e64201e54408342a1757c1cd2e369b352a88ce96a05e8a4d7e91cad9690
+
+  MAKECAT_REF: ee7aa4dd1d10ad5f254020ca0637df5abcc95618
+  CLANG_CL_LINUX_REF: 84e723d170e7611c55fff30c44d24c5a04bd4cb7
+
+  EWDK_VERSION: "26100.6584"
+  EWDK_URL: https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/EWDK_ge_release_svc_prod1_26100_250904-1728.iso
+  EWDK_SHA256: 9f48251dd24ad31aac206d8256e95bda5f90a9783982c45a8aafeb9054562379
+  WINSDKVER: "10.0.26100.0"
+  VCTOOLSVER: "14.44.35207"
+
+  RUST_TOOLCHAIN: nightly-2026-08-31
+  CBINDGEN_VERSION: "0.29.4"
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Validate version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Fail clearly if MAJOR/MINOR repository variables were not set.
+          test -n "${{ vars.MAJOR }}"
+          test -n "${{ vars.MINOR }}"
+
+          [[ "${{ vars.MAJOR }}" =~ ^[0-9]+$ ]]
+          [[ "${{ vars.MINOR }}" =~ ^[0-9]+$ ]]
+
+          # Microsoft requires every DriverVer component to be < 65535.
+          (( 10#${{ vars.MAJOR }} < 65535 ))
+          (( 10#${{ vars.MINOR }} < 65535 ))
+
+          [[ "${VERSION}" =~ ^1\.[0-9]+\.[0-9]+\.0$ ]]
+          echo "Building driver/release version ${VERSION}"
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          df -h /
+
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /opt/hostedtoolcache
+          sudo docker system prune --all --force || true
+          sudo apt-get clean
+
+          df -h /
+
+      - name: Resolve floating qemus master commits
+        id: refs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          d3d11_sha="$(
+            git ls-remote "${D3D11_REPO}" refs/heads/master | awk '{print $1}'
+          )"
+          kmd_sha="$(
+            git ls-remote "${KMD_REPO}" refs/heads/master | awk '{print $1}'
+          )"
+
+          [[ "${d3d11_sha}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${kmd_sha}" =~ ^[0-9a-f]{40}$ ]]
+
+          # Resolve the DXVK gitlink from the exact D3D11 commit without
+          # checking out the working tree.
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "${tmp}"' EXIT
+
+          git -C "${tmp}" init --quiet
+          git -C "${tmp}" remote add origin "${D3D11_REPO}"
+          git -C "${tmp}" fetch --quiet --depth=1 origin "${d3d11_sha}"
+
+          fetched_sha="$(git -C "${tmp}" rev-parse FETCH_HEAD)"
+          test "${fetched_sha}" = "${d3d11_sha}"
+
+          dxvk_sha="$(
+            git -C "${tmp}" ls-tree "${d3d11_sha}" thirdparty/dxvk \
+              | awk '{print $3}'
+          )"
+          [[ "${dxvk_sha}" =~ ^[0-9a-f]{40}$ ]]
+
+          echo "D3D11 master: ${d3d11_sha}"
+          echo "DXVK gitlink: ${dxvk_sha}"
+          echo "KMD master:   ${kmd_sha}"
+
+          {
+            echo "d3d11_sha=${d3d11_sha}"
+            echo "dxvk_sha=${dxvk_sha}"
+            echo "kmd_sha=${kmd_sha}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Build package
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: ./Dockerfile
+          target: artifact
+          push: false
+          pull: false
+          provenance: false
+
+          # The two current masters are resolved once above. Full 40-character
+          # commit fragments make each named context immutable for this run.
+          build-contexts: |
+            d3d11=${{ env.D3D11_REPO }}#${{ steps.refs.outputs.d3d11_sha }}
+            kmd=${{ env.KMD_REPO }}#${{ steps.refs.outputs.kmd_sha }}
+
+          build-args: |
+            VERSION_ARG=${{ env.VERSION }}
+
+            D3D11_SHA=${{ steps.refs.outputs.d3d11_sha }}
+            DXVK_SHA=${{ steps.refs.outputs.dxvk_sha }}
+            KMD_SHA=${{ steps.refs.outputs.kmd_sha }}
+
+            MESA_ARCHIVE_URL=${{ env.MESA_ARCHIVE_URL }}
+            MESA_TREE_SHA256=${{ env.MESA_TREE_SHA256 }}
+
+            MAKECAT_REF=${{ env.MAKECAT_REF }}
+            CLANG_CL_LINUX_REF=${{ env.CLANG_CL_LINUX_REF }}
+
+            EWDK_VERSION=${{ env.EWDK_VERSION }}
+            EWDK_URL=${{ env.EWDK_URL }}
+            EWDK_SHA256=${{ env.EWDK_SHA256 }}
+            WINSDKVER=${{ env.WINSDKVER }}
+            VCTOOLSVER=${{ env.VCTOOLSVER }}
+
+            RUST_TOOLCHAIN=${{ env.RUST_TOOLCHAIN }}
+            CBINDGEN_VERSION=${{ env.CBINDGEN_VERSION }}
+
+          outputs: type=local,dest=./out
+
+          # qemus master changes invalidate only stages consuming their named
+          # contexts. Pinned Mesa/EWDK/toolchain stages remain reusable.
+          cache-from: type=gha,scope=qemus-virtio-gpu-x64
+          cache-to: type=gha,mode=max,scope=qemus-virtio-gpu-x64,ignore-error=true
+
+      - name: Verify exported package and version
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          required=(
+            virtio_wddm_rs.inf
+            virtio_wddm_rs.cat
+            virtio_wddm_rs.sys
+            virtio_gpu_wddm_rs.pdb
+            dx11um_virtio.dll
+            dx11um_virtio.debug
+            vulkan_virtio.dll
+            vulkan_virtio.debug
+            virtio_icd.x86_64.json
+            virtio_test_signing.cer
+            BUILDINFO.txt
+          )
+
+          for file_name in "${required[@]}"; do
+            test -s "out/${file_name}"
+          done
+
+          # The release version must literally equal the installed Windows
+          # DriverVer version, not merely resemble it.
+          driver_version="$(
+            sed -n 's/^DriverVer=[^,]*,[[:space:]]*//p' out/virtio_wddm_rs.inf
+          )"
+          test "${driver_version}" = "${VERSION}"
+
+          grep -Fq "Driver / release version:           ${VERSION}" out/BUILDINFO.txt
+          grep -Fq "${{ steps.refs.outputs.d3d11_sha }}" out/BUILDINFO.txt
+          grep -Fq "${{ steps.refs.outputs.dxvk_sha }}" out/BUILDINFO.txt
+          grep -Fq "${{ steps.refs.outputs.kmd_sha }}" out/BUILDINFO.txt
+          grep -Fq "${MESA_TREE_SHA256}" out/BUILDINFO.txt
+
+          echo
+          echo "Driver version: ${driver_version}"
+          cat out/BUILDINFO.txt
+          echo
+          find out -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Create release ZIP
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          archive="virtio-gpu-${VERSION}.zip"
+
+          python3 - "${archive}" <<'PY'
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          archive = Path(sys.argv[1])
+          source = Path("out")
+
+          with zipfile.ZipFile(
+              archive,
+              "w",
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=9,
+          ) as zf:
+              for path in sorted(source.iterdir()):
+                  if path.is_file():
+                      zf.write(path, path.name)
+          PY
+
+          test -s "${archive}"
+          sha256sum "${archive}"
+
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: virtio-gpu-${{ env.VERSION }}
+          path: |
+            out/
+            virtio-gpu-${{ env.VERSION }}.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Create a release
+        uses: action-pack/github-release@d887b892618f95e19985108bfbc0c26833efa505
+        with:
+          tag: "v${{ env.VERSION }}"
+          title: "v${{ env.VERSION }}"
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+
+      - name: Add package to release
+        env:
+          GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gh release upload \
+            "v${VERSION}" \
+            "virtio-gpu-${VERSION}.zip"
+
+      - name: Increment version variable
+        uses: action-pack/increment@1458c307cedd62641619be2480c6263cf39864ac
+        with:
+          name: 'MINOR'
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
+
+      - name: Send mail
+        uses: action-pack/send-mail@33d560748d5c56be2a180c578ba4cf92b22a4723
+        with:
+          to: ${{ secrets.MAILTO }}
+          from: Github Actions <${{ secrets.MAILTO }}>
+          connection_url: ${{ secrets.MAIL_CONNECTION }}
+          subject: Build of ${{ github.event.repository.name }} v${{ env.VERSION }} completed
+          body: |
+            The build job of ${{ github.event.repository.name }} v${{ env.VERSION }} was completed successfully!
+
+            Driver version: ${{ env.VERSION }}
+            D3D11: ${{ steps.refs.outputs.d3d11_sha }}
+            KMD: ${{ steps.refs.outputs.kmd_sha }}
+
+            See https://github.com/${{ github.repository }}/actions for more information.
