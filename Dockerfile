@@ -1,10 +1,16 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316
+ARG BUILDER_IMAGE=buildpack-deps:sid@sha256:dfc7595de3e15149f7eefe40b41477d6dc90fd46bf901890fd97f9a32d2b2fa0
+ARG DEBIAN_SNAPSHOT=20260831T235959Z
+ARG MINGW_GCC_PKG_VERSION=16.2.0-1+29
+ARG MINGW_HEADERS_PKG_VERSION=14.0.0-1
 
-FROM ${UBUNTU_IMAGE} AS toolchain
+FROM ${BUILDER_IMAGE} AS toolchain
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG DEBIAN_SNAPSHOT
+ARG MINGW_GCC_PKG_VERSION
+ARG MINGW_HEADERS_PKG_VERSION
 ARG RUST_TOOLCHAIN=nightly-2026-08-31
 ARG CBINDGEN_VERSION=0.29.4
 
@@ -12,26 +18,31 @@ ENV RUSTUP_HOME=/opt/rustup
 ENV CARGO_HOME=/opt/cargo
 ENV PATH=/opt/cargo/bin:/opt/mingw-posix/bin:${PATH}
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
+# buildpack-deps already contains the generic native source-build stack
+# (gcc/g++/make, git, curl, file, common development libraries, etc.).
+# Only install the project-specific tools and the Windows cross compiler.
+# Use an immutable Debian archive snapshot so Sid cannot drift between runs.
+RUN set -eux; \
+    rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list; \
+    printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/%s/ sid main\n' \
+      "${DEBIAN_SNAPSHOT}" > /etc/apt/sources.list; \
+    apt-get -o Acquire::Retries=5 update; \
+    apt-get install -y --no-install-recommends \
       aria2 \
       bison \
-      build-essential \
-      ca-certificates \
       clang \
       cmake \
-      curl \
-      file \
       flex \
       gettext \
-      git \
       glslang-tools \
       jq \
       libclang-dev \
       libexpat1-dev \
       libwine-dev \
       lld \
-      mingw-w64 \
+      gcc-mingw-w64-x86-64-posix="${MINGW_GCC_PKG_VERSION}" \
+      g++-mingw-w64-x86-64-posix="${MINGW_GCC_PKG_VERSION}" \
+      mingw-w64-x86-64-dev="${MINGW_HEADERS_PKG_VERSION}" \
       ninja-build \
       openssl \
       osslsigncode \
@@ -39,9 +50,11 @@ RUN apt-get update \
       pkg-config \
       python3 \
       python3-dev \
-      python3-venv \
-      zlib1g-dev \
- && rm -rf /var/lib/apt/lists/*
+      python3-venv; \
+    test "$(dpkg-query -W -f='${Version}' gcc-mingw-w64-x86-64-posix)" = "${MINGW_GCC_PKG_VERSION}"; \
+    test "$(dpkg-query -W -f='${Version}' g++-mingw-w64-x86-64-posix)" = "${MINGW_GCC_PKG_VERSION}"; \
+    test "$(dpkg-query -W -f='${Version}' mingw-w64-x86-64-dev)" = "${MINGW_HEADERS_PKG_VERSION}"; \
+    rm -rf /var/lib/apt/lists/*
 
 # Make the POSIX-threading MinGW compiler the unqualified x86_64-w64-mingw32
 # toolchain used by Mesa and virtio-d3d11.
@@ -51,7 +64,14 @@ RUN set -eux; \
     ln -s "$(command -v x86_64-w64-mingw32-g++-posix)" /opt/mingw-posix/bin/x86_64-w64-mingw32-g++; \
     for tool in ar gcc-ar ld objcopy ranlib strip windres; do \
       ln -s "$(command -v x86_64-w64-mingw32-${tool})" "/opt/mingw-posix/bin/x86_64-w64-mingw32-${tool}"; \
-    done
+    done; \
+    test "$(x86_64-w64-mingw32-gcc -dumpfullversion)" = "16.2.0"; \
+    printf '#include <windows.h>\nint main(void) { bool ok = true; return ok ? 0 : 1; }\n' > /tmp/c23-probe.c; \
+    x86_64-w64-mingw32-gcc -c /tmp/c23-probe.c -o /tmp/c23-probe.o; \
+    printf '#include <windows.h>\n_Maybenull_ int *p;\nint main(void) { return p != 0; }\n' > /tmp/sal-probe.c; \
+    x86_64-w64-mingw32-gcc -c /tmp/sal-probe.c -o /tmp/sal-probe.o; \
+    rm -f /tmp/c23-probe.c /tmp/c23-probe.o /tmp/sal-probe.c /tmp/sal-probe.o; \
+    x86_64-w64-mingw32-gcc --version | head -1
 
 # Pin the Rust compiler date and cbindgen version. rustup itself is only the
 # bootstrap mechanism; the installed compiler/toolchain is the dated nightly.
@@ -66,6 +86,7 @@ RUN curl --proto '=https' --tlsv1.2 --fail --location \
  && rustc --version \
  && cargo --version \
  && cbindgen --version
+
 
 FROM toolchain AS ewdk
 
@@ -235,6 +256,7 @@ RUN meson setup \
  && grep -q 'vulkan_virtio.dll' /out/virtio_icd.x86_64.json \
  && file /out/vulkan_virtio.dll | grep -q 'PE32+'
 
+
 FROM toolchain AS d3d11-build
 
 ARG D3D11_SHA
@@ -288,6 +310,10 @@ RUN set -eux; \
 
 FROM toolchain AS package
 
+ARG BUILDER_IMAGE
+ARG DEBIAN_SNAPSHOT
+ARG MINGW_GCC_PKG_VERSION
+ARG MINGW_HEADERS_PKG_VERSION
 ARG VERSION_ARG
 ARG KMD_SHA
 ARG D3D11_SHA
@@ -325,7 +351,7 @@ EOF
 
 # The GitHub workflow owns the package version. Windows requires DriverVer to
 # use four numeric components, so VERSION_ARG is already the exact value used
-# for the GitHub Release (for example 1.2.37.0). Patch only the throw-away
+# for the GitHub Release (for example 20.16.0.0). Patch only the throw-away
 # BuildKit copy of the floating KMD source; upstream master remains untouched.
 RUN set -eux; \
     test -n "${VERSION_ARG}"; \
@@ -436,7 +462,10 @@ Windows SDK:                       ${WINSDKVER}
 MSVC tools:                        ${VCTOOLSVER}
 Rust:                              ${RUST_TOOLCHAIN}
 cbindgen:                          ${CBINDGEN_VERSION}
-Ubuntu base manifest:              sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316
+Builder image:                     ${BUILDER_IMAGE}
+Debian package snapshot:            ${DEBIAN_SNAPSHOT}
+MinGW GCC packages:                 ${MINGW_GCC_PKG_VERSION}
+MinGW-w64 headers:                  ${MINGW_HEADERS_PKG_VERSION}
 EOF
 
 # Final package validation.
