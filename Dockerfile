@@ -343,6 +343,8 @@ ARG CBINDGEN_VERSION
 
 ENV VCTOOLSVER=${VCTOOLSVER}
 ENV WINSDKVER=${WINSDKVER}
+ENV RUSTUP_TOOLCHAIN=${RUST_TOOLCHAIN}
+ENV RUSTUP_AUTO_INSTALL=0
 
 COPY --from=ewdk /opt/ewdk /opt/ewdk
 COPY --from=makecat-build /out/makecat /usr/local/bin/makecat
@@ -448,7 +450,17 @@ export KEY="/opt/test-cert/key.pem"
 EOF
 
 # Build/package the floating KMD master using the pinned environment and the
-# two UMD artifacts. BuildKit reuses all upstream stages when only KMD changes.
+# two UMD artifacts. RUSTUP_TOOLCHAIN overrides the repository's floating
+# rust-toolchain.toml (`channel = "nightly"`), while RUSTUP_AUTO_INSTALL=0
+# prevents rustup from silently downloading a different nightly.
+RUN set -eux; \
+    rustup show active-toolchain | grep -F "${RUST_TOOLCHAIN}"; \
+    rustup target list --installed | grep -Fx 'x86_64-pc-windows-msvc'; \
+    sysroot="$(rustc --print sysroot)"; \
+    test -f "${sysroot}/lib/rustlib/src/rust/library/Cargo.lock"; \
+    rustc --version; \
+    cargo --version
+
 RUN --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/opt/cargo/git \
     ./dist.sh
