@@ -1,15 +1,5 @@
 # syntax=docker/dockerfile:1.7
 
-# Production builder for the anonymix/qemus VirtIO-GPU WDDM stack.
-#
-# Floating source inputs are intentionally limited to the two named BuildKit
-# contexts supplied by build.yml:
-#   - d3d11 -> qemus/virtio-d3d11 master, resolved to one exact SHA per run
-#   - kmd   -> qemus/virtio-drivers-windows master, resolved to one exact SHA per run
-#
-# All other project/toolchain inputs are pinned below or supplied as pinned
-# build arguments by build.yml.
-
 ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316
 
 FROM ${UBUNTU_IMAGE} AS toolchain
@@ -76,7 +66,6 @@ RUN curl --proto '=https' --tlsv1.2 --fail --location \
  && rustc --version \
  && cargo --version \
  && cbindgen --version
-
 
 FROM toolchain AS ewdk
 
@@ -245,7 +234,6 @@ RUN meson setup \
  && cp /src/mesa/src/virtio/virtio-gpu/wddm_hw.h /out/mesa_wddm_hw.h \
  && grep -q 'vulkan_virtio.dll' /out/virtio_icd.x86_64.json \
  && file /out/vulkan_virtio.dll | grep -q 'PE32+'
-
 
 FROM toolchain AS d3d11-build
 
