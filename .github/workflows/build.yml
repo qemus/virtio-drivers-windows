@@ -25,7 +25,7 @@ env:
   MINGW_HEADERS_PKG_VERSION: "14.0.0-1"
 
   MESA_ARCHIVE_URL: https://gitlab.freedesktop.org/anonymix007/mesa/-/archive/venus-win32/mesa-venus-win32.tar.gz
-  MESA_TREE_SHA256: 9f216e64201e54408342a1757c1cd2e369b352a88ce96a05e8a4d7e91cad9690
+  MESA_TREE_SHA256: 9070b043639cf230dbcedbe2614d649101c12e0a9c4ab2836c201b8ab652eab0
 
   MAKECAT_REF: ee7aa4dd1d10ad5f254020ca0637df5abcc95618
   CLANG_CL_LINUX_REF: 84e723d170e7611c55fff30c44d24c5a04bd4cb7
