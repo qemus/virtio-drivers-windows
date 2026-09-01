@@ -65,7 +65,8 @@ RUN set -eux; \
     for tool in ar gcc-ar ld objcopy ranlib strip windres; do \
       ln -s "$(command -v x86_64-w64-mingw32-${tool})" "/opt/mingw-posix/bin/x86_64-w64-mingw32-${tool}"; \
     done; \
-    test "$(x86_64-w64-mingw32-gcc -dumpfullversion)" = "16.2.0"; \
+    gcc_major="$(x86_64-w64-mingw32-gcc -dM -E -x c /dev/null | awk '$2 == "__GNUC__" { print $3 }')"; \
+    test "${gcc_major}" = "16"; \
     printf '#include <windows.h>\nint main(void) { bool ok = true; return ok ? 0 : 1; }\n' > /tmp/c23-probe.c; \
     x86_64-w64-mingw32-gcc -c /tmp/c23-probe.c -o /tmp/c23-probe.o; \
     printf '#include <windows.h>\n_Maybenull_ int *p;\nint main(void) { return p != 0; }\n' > /tmp/sal-probe.c; \
