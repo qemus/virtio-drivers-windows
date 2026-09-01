@@ -40,6 +40,7 @@ RUN set -eux; \
       libexpat1-dev \
       libwine-dev \
       lld \
+      llvm \
       gcc-mingw-w64-x86-64-posix="${MINGW_GCC_PKG_VERSION}" \
       g++-mingw-w64-x86-64-posix="${MINGW_GCC_PKG_VERSION}" \
       mingw-w64-x86-64-dev="${MINGW_HEADERS_PKG_VERSION}" \
@@ -354,6 +355,7 @@ ENV VCTOOLSVER=${VCTOOLSVER}
 ENV WINSDKVER=${WINSDKVER}
 ENV RUSTUP_TOOLCHAIN=${RUST_TOOLCHAIN}
 ENV RUSTUP_AUTO_INSTALL=0
+ENV AR_x86_64_pc_windows_msvc=llvm-lib
 
 COPY --from=ewdk /opt/ewdk /opt/ewdk
 COPY --from=makecat-build /out/makecat /usr/local/bin/makecat
@@ -465,6 +467,10 @@ EOF
 RUN set -eux; \
     rustup show active-toolchain | grep -F "${RUST_TOOLCHAIN}"; \
     rustup target list --installed | grep -Fx 'x86_64-pc-windows-msvc'; \
+    test "$(command -v "${AR_x86_64_pc_windows_msvc}")" = "/usr/bin/llvm-lib"; \
+    llvm-lib /? >/tmp/llvm-lib-help.txt 2>&1 || true; \
+    grep -qi 'LLVM Lib' /tmp/llvm-lib-help.txt; \
+    rm -f /tmp/llvm-lib-help.txt; \
     sysroot="$(rustc --print sysroot)"; \
     test -f "${sysroot}/lib/rustlib/src/rust/library/Cargo.lock"; \
     rustc --version; \
