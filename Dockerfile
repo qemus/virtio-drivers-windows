@@ -291,7 +291,7 @@ RUN set -eux; \
 
 WORKDIR /src/d3d11
 RUN set -eux; \
-    vulkan_import="$(find /usr -type f -name 'libvulkan-1.a' -print -quit)"; \
+    vulkan_import="$(find /usr/lib -type f -path '*/wine/x86_64-windows/libvulkan-1.a' -print -quit)"; \
     test -n "${vulkan_import}"; \
     export LIBRARY_PATH="$(dirname "${vulkan_import}")"; \
     make -j"$(nproc)" DXVK_GIT_VERSION="${DXVK_SHA}"; \
