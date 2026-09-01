@@ -322,6 +322,15 @@ RUN set -eux; \
     fi
 
 
+# Successful cache checkpoint for all expensive prerequisites.
+# The CI workflow builds this target first with the cache-only exporter so
+# these layers are published even if the later KMD/package stage fails.
+FROM scratch AS cache-seed
+COPY --from=ewdk /opt/ewdk/vfs-overlay.json /ewdk-vfs-overlay.json
+COPY --from=makecat-build /out/makecat /makecat
+COPY --from=mesa-build /out/vulkan_virtio.dll /vulkan_virtio.dll
+COPY --from=d3d11-build /out/dx11um_virtio.dll /dx11um_virtio.dll
+
 FROM toolchain AS package
 
 ARG BUILDER_IMAGE
