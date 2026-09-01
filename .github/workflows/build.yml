@@ -11,9 +11,7 @@ permissions:
   contents: read
 
 env:
-  # Windows DriverVer requires four numeric components, so the required fourth
-  # component is fixed at zero. This exact value is used everywhere.
-  VERSION: 1.${{ vars.MAJOR }}.${{ vars.MINOR }}.0
+  VERSION: ${{ vars.MAJOR }}.${{ vars.MINOR }}.0.0
 
   # Only these two repositories float. Each run resolves master once and then
   # passes the exact SHA to BuildKit as a named Git context.
