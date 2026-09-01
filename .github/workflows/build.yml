@@ -19,6 +19,11 @@ env:
   KMD_REPO: https://github.com/qemus/virtio-drivers-windows.git
 
   # Everything below is pinned.
+  BUILDER_IMAGE: buildpack-deps:sid@sha256:dfc7595de3e15149f7eefe40b41477d6dc90fd46bf901890fd97f9a32d2b2fa0
+  DEBIAN_SNAPSHOT: "20260831T235959Z"
+  MINGW_GCC_PKG_VERSION: "16.2.0-1+29"
+  MINGW_HEADERS_PKG_VERSION: "14.0.0-1"
+
   MESA_ARCHIVE_URL: https://gitlab.freedesktop.org/anonymix007/mesa/-/archive/venus-win32/mesa-venus-win32.tar.gz
   MESA_TREE_SHA256: 9f216e64201e54408342a1757c1cd2e369b352a88ce96a05e8a4d7e91cad9690
 
@@ -155,6 +160,11 @@ jobs:
             kmd=${{ env.KMD_REPO }}#${{ steps.refs.outputs.kmd_sha }}
 
           build-args: |
+            BUILDER_IMAGE=${{ env.BUILDER_IMAGE }}
+            DEBIAN_SNAPSHOT=${{ env.DEBIAN_SNAPSHOT }}
+            MINGW_GCC_PKG_VERSION=${{ env.MINGW_GCC_PKG_VERSION }}
+            MINGW_HEADERS_PKG_VERSION=${{ env.MINGW_HEADERS_PKG_VERSION }}
+
             VERSION_ARG=${{ env.VERSION }}
 
             D3D11_SHA=${{ steps.refs.outputs.d3d11_sha }}
@@ -218,6 +228,10 @@ jobs:
           grep -Fq "${{ steps.refs.outputs.dxvk_sha }}" out/BUILDINFO.txt
           grep -Fq "${{ steps.refs.outputs.kmd_sha }}" out/BUILDINFO.txt
           grep -Fq "${MESA_TREE_SHA256}" out/BUILDINFO.txt
+          grep -Fq "${BUILDER_IMAGE}" out/BUILDINFO.txt
+          grep -Fq "${DEBIAN_SNAPSHOT}" out/BUILDINFO.txt
+          grep -Fq "${MINGW_GCC_PKG_VERSION}" out/BUILDINFO.txt
+          grep -Fq "${MINGW_HEADERS_PKG_VERSION}" out/BUILDINFO.txt
 
           echo
           echo "Driver version: ${driver_version}"
