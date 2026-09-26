@@ -15,7 +15,7 @@ env:
 
   # Only these two repositories float. Each run resolves master once and then
   # passes the exact SHA to BuildKit as a named Git context.
-  D3D11_REPO: https://github.com/qemus/virtio-d3d11.git
+  D3D11_REPO: https://github.com/anonymix007/virtio-d3d11.git
   KMD_REPO: https://github.com/qemus/virtio-drivers-windows.git
 
   # Everything below is pinned.
